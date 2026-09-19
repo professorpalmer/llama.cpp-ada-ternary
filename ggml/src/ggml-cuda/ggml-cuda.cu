@@ -2552,6 +2552,170 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+// Ada surgery diagnostic: GGML_CUDA_GRAPH_STATS=1 prints, once per instantiated CUDA graph,
+// a histogram of the post-fusion dispatch groups (what actually became kernel launches).
+static bool ggml_cuda_graph_stats_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_GRAPH_STATS") != nullptr;
+    return enabled;
+}
+
+static std::map<std::string, int> & ggml_cuda_graph_stats_hist() {
+    static std::map<std::string, int> hist;
+    return hist;
+}
+
+static void ggml_cuda_graph_stats_record(const std::string & key) {
+    ++ggml_cuda_graph_stats_hist()[key];
+}
+
+// Ada surgery diagnostic: GGML_CUDA_OP_TIMING=1 (needs GGML_CUDA_DISABLE_GRAPHS=1) brackets every
+// post-fusion dispatch group with cudaEvents and prints per-group GPU time, averaged per graph,
+// every GGML_CUDA_OP_TIMING_EVERY graphs (default 64). Only graphs with >= 1000 nodes are
+// counted so warmup / tiny graphs do not pollute the decode profile.
+static bool ggml_cuda_op_timing_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_OP_TIMING") != nullptr;
+    return enabled;
+}
+
+struct ggml_cuda_op_timing_state {
+    std::vector<cudaEvent_t> pool;
+    size_t next = 0;
+    struct rec { cudaEvent_t a; cudaEvent_t b; std::string key; std::string name; };
+    std::vector<rec> recs;
+    std::map<std::string, std::pair<int, double>> acc; // key -> (count, ms)
+    int n_graphs = 0;
+    int every = 64;
+    std::string detail; // GGML_CUDA_OP_TIMING_DETAIL substring: print per-instance times for matching keys
+    bool detail_done = false;
+    const void * graph_key = nullptr; // graph-mode: which captured graph the recs belong to
+};
+
+static ggml_cuda_op_timing_state & ggml_cuda_op_timing_st() {
+    static ggml_cuda_op_timing_state st;
+    static bool init = false;
+    if (!init) {
+        init = true;
+        const char * e = getenv("GGML_CUDA_OP_TIMING_EVERY");
+        if (e) {
+            st.every = std::max(1, atoi(e));
+        }
+        const char * d = getenv("GGML_CUDA_OP_TIMING_DETAIL");
+        if (d) {
+            st.detail = d;
+        }
+    }
+    return st;
+}
+
+// Park the GPU so the CPU can enqueue the whole graph first; then inter-event deltas measure
+// kernel execution only, not host launch latency. GGML_CUDA_OP_TIMING_SPIN_MS (default 40).
+static __global__ void ggml_cuda_op_timing_spin_kernel(long long cycles) {
+    const long long start = clock64();
+    while (clock64() - start < cycles) {
+    }
+}
+
+static void ggml_cuda_op_timing_park(cudaStream_t stream) {
+    static const int spin_ms = [] {
+        const char * e = getenv("GGML_CUDA_OP_TIMING_SPIN_MS");
+        return e ? atoi(e) : 40;
+    }();
+    if (spin_ms <= 0) {
+        return;
+    }
+    static int clock_khz = 0;
+    if (clock_khz == 0) {
+        CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, ggml_cuda_get_device()));
+        if (clock_khz <= 0) {
+            clock_khz = 2000000;
+        }
+    }
+    const long long cycles = (long long) clock_khz * spin_ms;
+    ggml_cuda_op_timing_spin_kernel<<<1, 1, 0, stream>>>(cycles);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static cudaEvent_t ggml_cuda_op_timing_event() {
+    auto & st = ggml_cuda_op_timing_st();
+    if (st.next >= st.pool.size()) {
+        cudaEvent_t ev;
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDefault));
+        st.pool.push_back(ev);
+    }
+    return st.pool[st.next++];
+}
+
+static void ggml_cuda_op_timing_close(cudaStream_t stream, cudaEvent_t ev_start, const std::string & key, const char * name) {
+    auto & st = ggml_cuda_op_timing_st();
+    cudaEvent_t ev_end = ggml_cuda_op_timing_event();
+    CUDA_CHECK(cudaEventRecord(ev_end, stream));
+    st.recs.push_back({ ev_start, ev_end, key, name ? name : "" });
+}
+
+static void ggml_cuda_op_timing_flush(cudaStream_t stream, int n_nodes, bool keep_recs = false) {
+    auto & st = ggml_cuda_op_timing_st();
+    if (st.recs.empty()) {
+        return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const bool count_it = n_nodes >= 1000;
+    const bool detail_now = count_it && !st.detail.empty() && !st.detail_done && st.n_graphs >= 2;
+    for (size_t ri = 0; ri < st.recs.size(); ++ri) {
+        const auto & r = st.recs[ri];
+        if (!count_it) {
+            continue;
+        }
+        float ms = 0.0f;
+        const cudaError_t err = cudaEventElapsedTime(&ms, r.a, r.b);
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                GGML_LOG_INFO("[op-timing] cudaEventElapsedTime failed (%s) for %s; skipping this replay\n",
+                              cudaGetErrorString(err), r.key.c_str());
+            }
+            return;
+        }
+        auto & slot = st.acc[r.key];
+        slot.first  += 1;
+        slot.second += ms;
+        if (detail_now && r.key.find(st.detail) != std::string::npos) {
+            const std::string prev = ri > 0 ? st.recs[ri - 1].key : std::string("-");
+            GGML_LOG_INFO("[op-detail] %8.1f us  %-40s  prev=%s\n", 1000.0 * ms, r.name.c_str(), prev.c_str());
+        }
+    }
+    if (detail_now) {
+        st.detail_done = true;
+    }
+    if (!keep_recs) {
+        st.recs.clear();
+        st.next = 0;
+    }
+    if (!count_it) {
+        return;
+    }
+    if (++st.n_graphs % st.every != 0) {
+        return;
+    }
+    std::vector<std::pair<double, std::string>> rows;
+    double total = 0.0;
+    int n_launch_groups = 0;
+    for (const auto & kv : st.acc) {
+        rows.push_back({ kv.second.second / st.every, kv.first });
+        total += kv.second.second / st.every;
+        n_launch_groups += kv.second.first / st.every;
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    GGML_LOG_INFO("[op-timing] per-graph avg over %d graphs: total %.3f ms across %d groups\n", st.every, total, n_launch_groups);
+    for (const auto & r : rows) {
+        const auto & slot = st.acc[r.second];
+        const int n = slot.first / st.every;
+        GGML_LOG_INFO("[op-timing] %8.3f ms  %5d x %8.1f us  %s\n", r.first, n, n > 0 ? 1000.0 * r.first / n : 0.0, r.second.c_str());
+    }
+    st.acc.clear();
+}
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
@@ -2748,6 +2912,67 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 }
 
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
+// Ada surgery: GET_ROWS(cache[D, n_rs], ids[n_seqs]) -> [RESHAPE] -> GATED_DELTA_NET src[5].
+// build_rs gathers each layer's live recurrent state into a 3 MB temp that only the GDN kernel
+// reads. Measured in-graph (CUPTI): the gather kernel is 8.4 us/layer and its dirty 3 MB sits in
+// L2 until the FFN weight stream evicts it, making gate/up GEMVs in GDN layers ~15% slower than
+// the identical GEMVs in attention layers. When the gathered temp has no other consumer, skip the
+// GET_ROWS and let the kernel index the cache row directly. Single-sequence only: with several
+// sequences a gathered row may alias a row another sequence writes in the same op.
+static bool ggml_cuda_try_gdn_gather_skip(const ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_CUDA_GDN_GATHER_FUSION") != nullptr &&
+                                 atoi(getenv("GGML_CUDA_GDN_GATHER_FUSION")) == 0;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * gr = cgraph->nodes[node_idx];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        !ggml_is_contiguous(gr)) {
+        return false;
+    }
+    const ggml_tensor * cache = gr->src[0];
+    const ggml_tensor * ids   = gr->src[1];
+    if (cache->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || cache->data == nullptr || ids->data == nullptr ||
+        cache->nb[0] != sizeof(float) || cache->nb[1] % sizeof(float) != 0 || !ggml_is_contiguous(ids) ||
+        ids->ne[0] != 1 || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        gr->ne[1] != 1 || gr->ne[2] != 1 || gr->ne[3] != 1 || gr->ne[0] != cache->ne[0]) {
+        return false;
+    }
+    if (ggml_node_get_use_count(cgraph, node_idx) != 1) {
+        return false;
+    }
+    const ggml_tensor * cur = gr;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_GATED_DELTA_NET && n->src[5] == cur) {
+            const ggml_tensor * v = n->src[2];
+            const int64_t       D = v->ne[0] * v->ne[0] * v->ne[1];
+            if (gr->ne[0] != D || v->ne[3] != 1 || ggml_nelements(cur) != D) {
+                return false;
+            }
+            ggml_cuda_gated_delta_net_gather gather;
+            gather.base       = (const float *) cache->data;
+            gather.ids        = (const int32_t *) ids->data;
+            gather.row_stride = (int64_t) (cache->nb[1] / sizeof(float));
+            ggml_cuda_gdn_gather_register(n, gather);
+            return true;
+        }
+        if (n->op == GGML_OP_RESHAPE && n->src[0] == cur) {
+            if (ggml_node_get_use_count(cgraph, j) != 1) {
+                return false;
+            }
+            cur = n;
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s] == cur || (n->view_src != nullptr && n->view_src == gr)) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
 static int ggml_cuda_try_gdn_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
@@ -4281,6 +4506,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            if (ggml_cuda_graph_stats_enabled()) {
+                ggml_cuda_graph_stats_hist().clear();
+            }
+            ggml_cuda_gdn_gather_clear();
+            if (ggml_cuda_op_timing_enabled() && !use_cuda_graph && cgraph->n_nodes >= 1000) {
+                ggml_cuda_op_timing_park(cuda_ctx->stream());
+            }
+            if (ggml_cuda_op_timing_enabled() && use_cuda_graph) {
+                // Graph mode: events are captured as event-record nodes and re-read after every
+                // replay, so per-group times are pure GPU time with no host launch gaps.
+                auto & st = ggml_cuda_op_timing_st();
+                st.recs.clear();
+                st.next = 0;
+                st.graph_key = graph_key;
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4320,6 +4561,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                // Ada surgery: recurrent-state gather folded into the GDN kernel (no temp, no kernel).
+                if (node->op == GGML_OP_GET_ROWS && !is_concurrent_event_active &&
+                        ggml_cuda_try_gdn_gather_skip(cgraph, i)) {
                     continue;
                 }
 
@@ -4381,7 +4628,43 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                const bool op_timing = ggml_cuda_op_timing_enabled() && (!use_cuda_graph || cuda_graph_update_required);
+                cudaEvent_t ev_start = nullptr;
+                if (op_timing) {
+                    ev_start = ggml_cuda_op_timing_event();
+                    CUDA_CHECK(cudaEventRecord(ev_start, cuda_ctx->stream()));
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                std::string timing_key;
+                if (ggml_cuda_graph_stats_enabled() || op_timing) {
+                    // Ada surgery diagnostic: record what actually got dispatched, post-fusion.
+                    std::string key;
+                    for (int k = i; k <= i + nodes_to_skip; ++k) {
+                        const ggml_tensor * t = cgraph->nodes[k];
+                        if (k > i) {
+                            key += "+";
+                        }
+                        key += ggml_op_name(t->op);
+                        if (t->op == GGML_OP_UNARY) {
+                            key += std::string(":") + ggml_unary_op_name(ggml_get_unary_op(t));
+                        } else if (t->op == GGML_OP_GLU) {
+                            key += std::string(":") + ggml_glu_op_name(ggml_get_glu_op(t));
+                        } else if (t->op == GGML_OP_MUL_MAT && t->src[0]) {
+                            key += std::string(":") + ggml_type_name(t->src[0]->type) + "[" + std::to_string(t->src[0]->ne[0]) +
+                                   "x" + std::to_string(t->src[0]->ne[1]) + "]";
+                        } else if (t->op == GGML_OP_RMS_NORM || t->op == GGML_OP_L2_NORM || t->op == GGML_OP_MUL ||
+                                   t->op == GGML_OP_ADD || t->op == GGML_OP_CPY || t->op == GGML_OP_CONT ||
+                                   t->op == GGML_OP_GET_ROWS || t->op == GGML_OP_SCALE || t->op == GGML_OP_CONCAT) {
+                            key += "[" + std::to_string(t->ne[0]) + "x" + std::to_string(t->ne[1]) + "x" + std::to_string(t->ne[2]) + "]";
+                        }
+                    }
+                    if (ggml_cuda_graph_stats_enabled()) {
+                        ggml_cuda_graph_stats_record(key);
+                    }
+                    timing_key = std::move(key);
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -4390,6 +4673,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    if (op_timing) {
+                        ggml_cuda_op_timing_close(cuda_ctx->stream(), ev_start, timing_key, node->name);
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4460,10 +4746,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (op_timing) {
+                    ggml_cuda_op_timing_close(cuda_ctx->stream(), ev_start, timing_key, node->name);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+            if (ggml_cuda_op_timing_enabled() && !use_cuda_graph) {
+                ggml_cuda_op_timing_flush(cuda_ctx->stream(), cgraph->n_nodes);
             }
         }
 
@@ -4491,12 +4783,46 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            // Ada surgery diagnostic: how many real GPU nodes ended up in the graph,
+            // and what ggml ops produced them. GGML_CUDA_GRAPH_STATS=1 to enable.
+            if (ggml_cuda_graph_stats_enabled()) {
+                size_t n_cuda_nodes = 0;
+                CUDA_CHECK(cudaGraphGetNodes(graph->graph, nullptr, &n_cuda_nodes));
+                int n_real = 0;
+                for (int i = 0; i < cgraph->n_nodes; ++i) {
+                    const ggml_tensor * t = cgraph->nodes[i];
+                    if (ggml_cuda_is_view_or_noop(t) || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                        continue;
+                    }
+                    ++n_real;
+                }
+                auto & hist = ggml_cuda_graph_stats_hist();
+                int n_groups = 0;
+                for (const auto & kv : hist) {
+                    n_groups += kv.second;
+                }
+                GGML_LOG_INFO("[graph-stats] ggml nodes=%d real(non-view)=%d dispatch groups=%d cuda graph nodes=%zu\n",
+                              cgraph->n_nodes, n_real, n_groups, n_cuda_nodes);
+                std::vector<std::pair<int, std::string>> sorted;
+                for (const auto & kv : hist) {
+                    sorted.push_back({ kv.second, kv.first });
+                }
+                std::sort(sorted.begin(), sorted.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+                for (const auto & kv : sorted) {
+                    GGML_LOG_INFO("[graph-stats]   %5d  %s\n", kv.first, kv.second.c_str());
+                }
+                hist.clear();
+            }
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (ggml_cuda_op_timing_enabled() && ggml_cuda_op_timing_st().graph_key == graph_key) {
+            // Event-record nodes captured above are refreshed by every replay of this graph.
+            ggml_cuda_op_timing_flush(cuda_ctx->stream(), cgraph->n_nodes, /*keep_recs=*/true);
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
