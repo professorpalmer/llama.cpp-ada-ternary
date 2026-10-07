@@ -85,6 +85,12 @@ json server_slot_stats::to_json() const {
         base["draft_n_accepted"] = n_draft_accepted;
     }
 
+    // a client can count force-closed turns without parsing reasoning_content for the budget message
+    if (reasoning_tracked) {
+        base["reasoning_n"]                = n_reasoning;
+        base["reasoning_budget_exhausted"] = reasoning_budget_exhausted;
+    }
+
     return base;
 }
 
@@ -1411,15 +1417,29 @@ json oaicompat_chat_params_parse(
     // --reasoning-max-tokens-floor: with thinking on, a client output cap below the floor is raised to it. A
     // thinking model spends its first thousands of tokens inside the thinking block; a 256-4096 token app cap
     // ends the request there with no answer. The reasoning budget still bounds the thinking.
+    // A per-request budget above the server's moves the floor with it (budget + 4096, the launcher's rule), and a
+    // request with no cap gets that floor instead of the server default -n: without this, a client that sends
+    // reasoning_budget_tokens 40960 and no max_tokens is cut off at -n inside its thinking.
     if (opt.reasoning_max_tokens_floor > 0 && inputs.enable_thinking && !chat_params.thinking_end_tags.empty()) {
+        int floor = opt.reasoning_max_tokens_floor;
+        const int req_budget = llama_params.value("reasoning_budget_tokens", -1);
+        if (req_budget > opt.reasoning_budget && req_budget >= 0) {
+            floor = std::max(floor, req_budget + 4096);
+        }
+        bool has_cap = false;
         for (const char * key : {"n_predict", "max_tokens", "max_completion_tokens"}) {
             if (llama_params.contains(key) && llama_params.at(key).is_number_integer()) {
                 const int v = llama_params.at(key).get<int>();
-                if (v > 0 && v < opt.reasoning_max_tokens_floor) {
-                    SRV_INF("%s %d raised to %d (thinking on, --reasoning-max-tokens-floor)\n", key, v, opt.reasoning_max_tokens_floor);
-                    llama_params[key] = opt.reasoning_max_tokens_floor;
+                has_cap = has_cap || v > 0;
+                if (v > 0 && v < floor) {
+                    SRV_INF("%s %d raised to %d (thinking on, --reasoning-max-tokens-floor)\n", key, v, floor);
+                    llama_params[key] = floor;
                 }
             }
+        }
+        if (!has_cap && floor > opt.reasoning_max_tokens_floor) {
+            SRV_INF("no output cap; n_predict set to %d (request reasoning budget %d)\n", floor, req_budget);
+            llama_params["n_predict"] = floor;
         }
     }
 

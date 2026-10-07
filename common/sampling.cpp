@@ -742,6 +742,14 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }
 
+bool common_sampler_reasoning_budget_report(const struct common_sampler * gsmpl, int32_t * n_reasoning, bool * exhausted) {
+    if (!gsmpl || !gsmpl->rbudget) {
+        return false;
+    }
+    common_reasoning_budget_get_report(gsmpl->rbudget, n_reasoning, exhausted);
+    return true;
+}
+
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return false;

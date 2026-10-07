@@ -2069,6 +2069,18 @@ private:
             res->content     = std::move(slot.generated_text);
             res->tokens      = std::move(slot.generated_tokens);
         }
+        {
+            int32_t n_reasoning = 0;
+            bool    exhausted   = false;
+            if (common_sampler_reasoning_budget_report(slot.smpl.get(), &n_reasoning, &exhausted)) {
+                slot.stats.reasoning_tracked          = true;
+                slot.stats.n_reasoning                = n_reasoning;
+                slot.stats.reasoning_budget_exhausted = exhausted;
+                if (exhausted) {
+                    SLT_INF(slot, "reasoning budget exhausted after %d reasoning tokens (end forced)\n", n_reasoning);
+                }
+            }
+        }
         res->stats           = slot.stats;
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
