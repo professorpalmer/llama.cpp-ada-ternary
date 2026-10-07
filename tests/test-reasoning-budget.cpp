@@ -426,8 +426,7 @@ static void test_reasoning_budget_report() {
     // null sampler
     report(nullptr, n, ex);
     GGML_ASSERT(n == 0 && !ex);
-    printf("  Test 'budget report' passed
-");
+    printf("  Test 'budget report' passed\n");
 }
 
 int main(void) {
