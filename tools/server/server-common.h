@@ -357,6 +357,11 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // reasoning budget report (only when the request ran with a budget sampler)
+    bool     reasoning_tracked          = false;
+    uint64_t n_reasoning                = 0;
+    bool     reasoning_budget_exhausted = false;
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

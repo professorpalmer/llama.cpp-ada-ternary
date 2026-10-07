@@ -363,12 +363,16 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
 }
 
 json server_task_result_cmpl_final::usage_json_oaicompat() {
-    return json {
+    json usage = {
         {"completion_tokens", n_decoded},
         {"prompt_tokens",     n_prompt_tokens},
         {"total_tokens",      n_decoded + n_prompt_tokens},
         {"prompt_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
     };
+    if (stats.reasoning_tracked) {
+        usage["completion_tokens_details"] = json { {"reasoning_tokens", stats.n_reasoning} };
+    }
+    return usage;
 }
 
 json server_task_result_cmpl_final::to_json_oaicompat() {
