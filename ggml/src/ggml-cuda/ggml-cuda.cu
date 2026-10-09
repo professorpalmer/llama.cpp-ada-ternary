@@ -3419,6 +3419,13 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 // The check walks every later node, so any other use of the output (or of a view of it) keeps the
 // plain transform, and use counts guard against consumers outside this graph. Returns the number of
 // nodes consumed (3 or 1) or 0 to fall through. GGML_CUDA_FWHT_FUSION=0 disables it.
+// GGML_CUDA_GLU_ALIAS_FUSE=0 turns off the two rules below (default on): a gate+up+GLU group whose GLU output lands on
+// the shared activation buffer still fuses on the quantized mat-vec path, and the Hadamard q8 rows then go to a pool block.
+static bool ggml_cuda_glu_alias_fuse_enabled() {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_GLU_ALIAS_FUSE"); return !(e && atoi(e) == 0); }();
+    return enabled;
+}
+
 static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
     static const bool disabled = getenv("GGML_CUDA_FWHT_FUSION") != nullptr &&
                                  atoi(getenv("GGML_CUDA_FWHT_FUSION")) == 0;
@@ -3562,8 +3569,20 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
         return 0; // the fused quantizer writes pad blocks in transform-width units
     }
     const size_t q8_bytes = (size_t) (ncols * ne0_padded) * sizeof(block_q8_1) / QK8_1;
+    // a gate+up+GLU group may fuse with its GLU output on top of mm (the allocator reuses mm's block once up is
+    // done); the fused mat-vec then writes the GLU output while other blocks still read the q8 rows from mm
+    bool glu_alias = false;
+    if (ggml_cuda_glu_alias_fuse_enabled()) {
+        for (int k = i_mm + 1; k < cgraph->n_nodes && k <= i_mm + 6; ++k) {
+            const ggml_tensor * g = cgraph->nodes[k];
+            if (g->op == GGML_OP_GLU && overlaps(g, mm)) {
+                glu_alias = true;
+                break;
+            }
+        }
+    }
     void * out = mm->data;
-    if (out_aliases_in) {
+    if (out_aliases_in || glu_alias) {
         auto blk = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
         out = blk->get();
         ctx.fwht_q8().held.push_back(std::move(blk));
@@ -3868,7 +3887,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int *         out_nodes,
                                                  const int           out_count,
                                                  const bool          is_topk_moe = false,
-                                                 const bool          allow_exact_alias = false) {
+                                                 const bool          allow_exact_alias = false,
+                                                 const ggml_tensor * ignore_src = nullptr) {
     // An exact alias is a destination that shares the base pointer, type and
     // contiguous layout of a source, i.e. element k of the destination is
     // element k of the source. Fusions whose kernels are elementwise within the
@@ -3910,7 +3930,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE) {
+                if (!src || src->op == GGML_OP_NONE || src == ignore_src) {
                     continue;
                 }
 
@@ -3979,7 +3999,18 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu)) {
             int out_nodes[] = { node_idx + 2 };
-            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1)) {
+                return true;
+            }
+            // The quantized mat-vec never reads the f32 activation inside the fused kernel: it reads q8 rows that were
+            // written before it (a pool buffer, or the Hadamard q8 rows, moved to the pool by ggml_cuda_try_fwht_q8 when
+            // this GLU output overlaps them). So an overlap with the shared activation alone is safe on that path.
+            if (ggml_cuda_glu_alias_fuse_enabled() && ffn_up->src[1] == ffn_gate->src[1] &&
+                    ggml_is_quantized(ffn_up->src[0]->type) && ggml_is_quantized(ffn_gate->src[0]->type) &&
+                    !ggml_cuda_should_fuse_mul_mat_vec_f(ffn_up) && ggml_cuda_should_fuse_mul_mat_vec_q(ffn_up)) {
+                return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1,
+                                                            false, false, ffn_up->src[1]);
+            }
         }
     }
 
