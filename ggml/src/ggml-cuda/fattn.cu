@@ -1072,6 +1072,12 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     }
     fa_sparse_apply<<<dim3((unsigned) ((n_host + 255)/256), n_q), 256, 0, stream>>>(mask_buf.get(), d_keep.get(), first, n_host,
         page, n_pages, m_s1);
+    static int64_t st_ops = 0;
+    if (++st_ops % 1024 == 1) {   // the first op and every 1024th: the path is engaged (printed while the server runs)
+        GGML_LOG_INFO("%s: GGML_CUDA_FA_SPARSE B=%lld P=%lld R=%lld%s: %lld ops; this op %d queries, host tail %lld cells, keeps %lld of %d pages + recent\n",
+            __func__, (long long) cfg.budget, (long long) cfg.page, (long long) cfg.recent, cfg.fast ? " fast" : "",
+            (long long) st_ops, n_q, (long long) n_host, (long long) keep_pages, n_pages);
+    }
     *mask_out = *M;
     mask_out->data      = mask_buf.get();
     mask_out->view_src  = nullptr;
