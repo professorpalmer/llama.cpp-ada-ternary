@@ -839,6 +839,40 @@ static __global__ void fa_sparse_last(const half * __restrict__ mask, int * __re
 }
 
 // masks out the host-tail columns of row j whose page is not kept (keep[j][p] == 0)
+// per query j: keep the pages from the one holding cell last+1-recent up to the one holding its last visible cell, and of
+// the pages before those the keep_pages with the highest bound (ties: lower page first); drop the rest. One block per
+// query, the scores in shared memory, the rank of each candidate by counting the candidates ahead of it.
+static __global__ void fa_sparse_select(const float * __restrict__ ub, const int * __restrict__ last_cell,
+        uint8_t * __restrict__ keep, const int n_pages, const int page, const int recent, const int keep_pages) {
+    extern __shared__ float s_ub[];
+    const int j    = blockIdx.x;
+    const int last = last_cell[j];
+    uint8_t * k = keep + (int64_t) j*n_pages;
+    const int last_page   = last < 0 ? -1 : last/page;
+    const int recent_page = last < 0 ? 0 : max(0, last + 1 - recent)/page;
+    for (int p = threadIdx.x; p < recent_page; p += blockDim.x) {
+        s_ub[p] = ub[(int64_t) j*n_pages + p];
+    }
+    __syncthreads();
+    for (int p = threadIdx.x; p < n_pages; p += blockDim.x) {
+        uint8_t v = 0;
+        if (p <= last_page) {
+            if (p >= recent_page) {
+                v = 1;
+            } else {
+                const float x = s_ub[p];
+                int rank = 0;
+                for (int q = 0; q < recent_page && rank < keep_pages; ++q) {
+                    const float y = s_ub[q];
+                    rank += (y > x) || (y == x && q < p);
+                }
+                v = rank < keep_pages;
+            }
+        }
+        k[p] = v;
+    }
+}
+
 static __global__ void fa_sparse_apply(half * __restrict__ mask, const uint8_t * __restrict__ keep, const int64_t first,
         const int64_t n_host, const int page, const int n_pages, const int64_t m_s1) {
     const int j = blockIdx.y;
@@ -882,8 +916,8 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     const int     page    = (int) cfg.page;
     const int     n_pages = (int) ((n_host + page - 1)/page);
     const int64_t keep_pages = std::max<int64_t>(1, cfg.budget/page);
-    if (n_pages <= keep_pages) {
-        return false;
+    if (n_pages <= keep_pages || n_pages > 12288) {
+        return false;   // nothing to drop, or more page scores than fa_sparse_select holds in shared memory (48 KB)
     }
     const int D = (int) K->ne[0], H_kv = (int) K->ne[2], n_head = (int) Q->ne[2], n_q = (int) Q->ne[1];
     if (cfg.fast && n_q > 8) {
@@ -979,59 +1013,65 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     fa_sparse_scores<<<dim3(n_pages, n_q), 256, 0, stream>>>((const float *) Q->data, mx, mn, ub.get(), D, n_pages,
         n_head, gqa, (int64_t) (Q->nb[1]/sizeof(float)), (int64_t) (Q->nb[2]/sizeof(float)), stride_pages);
 
-    // a copy of the mask, and the scores and host-tail mask columns on the host (causal boundary of each row)
+    // a copy of the mask, the causal boundary of each row in the host tail, and the pages to keep (all on the device)
     CUDA_CHECK(cudaMemcpyAsync(mask_buf.get(), M->data, (size_t) m_s1*m_rows*sizeof(half), cudaMemcpyDeviceToDevice, stream));
     ggml_cuda_pool_alloc<int> d_last(ctx.pool(), (size_t) n_q);
     fa_sparse_last<<<n_q, 256, 0, stream>>>((const half *) M->data, d_last.get(), first, n_host, m_s1);
-    std::vector<float> h_ub((size_t) n_q*n_pages);
-    std::vector<int>   h_last((size_t) n_q);
-    CUDA_CHECK(cudaMemcpyAsync(h_ub.data(), ub.get(), h_ub.size()*sizeof(float), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(h_last.data(), d_last.get(), h_last.size()*sizeof(int), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::vector<uint8_t> keep((size_t) n_q*n_pages, 0);
-    std::vector<std::pair<float, int>> cand;
-    static int64_t st_ops = 0, st_valid = 0, st_kept = 0;
-    for (int j = 0; j < n_q; ++j) {
-        const int64_t last = h_last[j];
-        if (last < 0) {
-            continue;   // nothing of the host tail is visible to this query
-        }
-        const int last_page = (int) (last/page);
-        uint8_t * k = keep.data() + (size_t) j*n_pages;
-        const int64_t recent_from = std::max<int64_t>(0, last + 1 - cfg.recent);
-        for (int p = (int) (recent_from/page); p <= last_page; ++p) {
-            k[p] = 1;
-        }
-        cand.clear();
-        for (int p = 0; p <= last_page; ++p) {
-            if (!k[p]) {
-                cand.push_back({ h_ub[(size_t) j*n_pages + p], p });
+    ggml_cuda_pool_alloc<uint8_t> d_keep(ctx.pool(), (size_t) n_q*n_pages);
+    fa_sparse_select<<<n_q, 256, n_pages*sizeof(float), stream>>>(ub.get(), d_last.get(), d_keep.get(), n_pages, page,
+        (int) cfg.recent, (int) keep_pages);
+    if (cfg.check) {
+        // the earlier host selection, same tie rule: count the pages where the two differ
+        std::vector<float>   h_ub((size_t) n_q*n_pages);
+        std::vector<int>     h_last((size_t) n_q);
+        std::vector<uint8_t> h_dev((size_t) n_q*n_pages), keep((size_t) n_q*n_pages, 0);
+        CUDA_CHECK(cudaMemcpyAsync(h_ub.data(), ub.get(), h_ub.size()*sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(h_last.data(), d_last.get(), h_last.size()*sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(h_dev.data(), d_keep.get(), h_dev.size(), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<std::pair<float, int>> cand;
+        for (int j = 0; j < n_q; ++j) {
+            const int64_t last = h_last[j];
+            if (last < 0) {
+                continue;
+            }
+            const int last_page = (int) (last/page);
+            uint8_t * k = keep.data() + (size_t) j*n_pages;
+            const int64_t recent_from = std::max<int64_t>(0, last + 1 - cfg.recent);
+            for (int p = (int) (recent_from/page); p <= last_page; ++p) {
+                k[p] = 1;
+            }
+            cand.clear();
+            for (int p = 0; p <= last_page; ++p) {
+                if (!k[p]) {
+                    cand.push_back({ h_ub[(size_t) j*n_pages + p], p });
+                }
+            }
+            const size_t take = (size_t) std::min<int64_t>(keep_pages, (int64_t) cand.size());
+            std::partial_sort(cand.begin(), cand.begin() + take, cand.end(),
+                [](const std::pair<float, int> & x, const std::pair<float, int> & y) {
+                    return x.first > y.first || (x.first == y.first && x.second < y.second); });
+            for (size_t i = 0; i < take; ++i) {
+                k[cand[i].second] = 1;
             }
         }
-        const size_t take = (size_t) std::min<int64_t>(keep_pages, (int64_t) cand.size());
-        std::partial_sort(cand.begin(), cand.begin() + take, cand.end(),
-            [](const std::pair<float, int> & x, const std::pair<float, int> & y) { return x.first > y.first; });
-        for (size_t i = 0; i < take; ++i) {
-            k[cand[i].second] = 1;
+        int64_t diff = 0;
+        for (size_t i = 0; i < keep.size(); ++i) {
+            diff += keep[i] != h_dev[i];
         }
-        int64_t kept = 0;
-        for (int p = 0; p <= last_page; ++p) {
-            kept += k[p] ? std::min<int64_t>(page, last + 1 - (int64_t) p*page) : 0;
+        static int64_t sel_ops = 0, sel_bad = 0;
+        ++sel_ops;
+        if (diff) {
+            ++sel_bad;
+            GGML_LOG_WARN("%s: CHECK selection differs from the host one in %lld of %lld pages\n", __func__,
+                (long long) diff, (long long) keep.size());
         }
-        st_valid += last + 1;
-        st_kept  += kept;
+        if (sel_ops % 4096 == 0) {
+            GGML_LOG_INFO("%s: CHECK selection: %lld ops, %lld differ\n", __func__, (long long) sel_ops, (long long) sel_bad);
+        }
     }
-    ggml_cuda_pool_alloc<uint8_t> d_keep(ctx.pool(), keep.size());
-    CUDA_CHECK(cudaMemcpyAsync(d_keep.get(), keep.data(), keep.size(), cudaMemcpyHostToDevice, stream));
     fa_sparse_apply<<<dim3((unsigned) ((n_host + 255)/256), n_q), 256, 0, stream>>>(mask_buf.get(), d_keep.get(), first, n_host,
         page, n_pages, m_s1);
-    CUDA_CHECK(cudaStreamSynchronize(stream));   // keep is a host vector
-    if (++st_ops % 1024 == 0) {
-        GGML_LOG_INFO("%s: GGML_CUDA_FA_SPARSE B=%lld P=%lld R=%lld: %lld ops, host tail kept %.1f %% of the visible cells\n",
-            __func__, (long long) cfg.budget, (long long) cfg.page, (long long) cfg.recent, (long long) st_ops,
-            100.0*st_kept/std::max<int64_t>(1, st_valid));
-    }
     *mask_out = *M;
     mask_out->data      = mask_buf.get();
     mask_out->view_src  = nullptr;
