@@ -837,6 +837,8 @@ struct ggml_backend_cuda_buffer_context {
     }
 };
 
+// GGML_CUDA_FA_SPARSE (fattn.cu): the attention ops the fast path takes (they stage their kept pages themselves)
+bool ggml_cuda_fa_sparse_eligible(const ggml_tensor * fa);
 // GGML_CUDA_FA_SPARSE_FAST (fattn.cu): writes into a K cache tensor invalidate its cached page bounds
 void ggml_cuda_fa_sparse_note_bytes(const void * p, size_t n);
 void ggml_cuda_fa_sparse_note_op(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
@@ -1248,6 +1250,63 @@ void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream
     return any ? (void *) (e->va2 + lo) : nullptr;
 }
 
+static const ggml_cuda_tier_entry * ggml_cuda_tier_find(const void * ptr);
+static bool ggml_cuda_tier_host_part(const ggml_cuda_tier_entry * e, size_t lo, size_t hi, size_t * a, size_t * b);
+
+// copy only the host pages with keep[p] != 0 (page p: cells first_cell + p*page ...) of [ptr, ptr + nbytes) into the
+// staging alias, from inside a kernel (no host sync: keep is on the device). Pages of the VRAM part and unkept pages
+// are not touched. Returns the alias of ptr, nullptr when ptr is not in a tiered buffer with staging.
+static __global__ void k_tier_stage_pages(const char * __restrict__ src, char * __restrict__ dst, const uint8_t * __restrict__ keep,
+        const size_t row_bytes, const int64_t first_cell, const int page, const size_t lo, const size_t hi, const int vec) {
+    const int p = blockIdx.x;
+    if (!keep[p]) {
+        return;
+    }
+    const size_t c0 = (size_t) (first_cell + (int64_t) p*page)*row_bytes, c1 = c0 + (size_t) page*row_bytes;
+    const size_t a = c0 > lo ? c0 : lo, b = c1 < hi ? c1 : hi;
+    if (vec == 16) {
+        for (size_t o = a + (size_t) threadIdx.x*16; o + 16 <= b; o += (size_t) blockDim.x*16) {
+            *(uint4 *) (dst + o) = *(const uint4 *) (src + o);
+        }
+    } else {
+        for (size_t o = a + threadIdx.x; o < b; o += blockDim.x) {
+            dst[o] = src[o];
+        }
+    }
+}
+
+void * ggml_cuda_tier_stage_pages(const void * ptr, size_t nbytes, size_t row_bytes, int64_t first_cell, int page, int n_pages,
+        const uint8_t * keep, cudaStream_t stream) {
+    const ggml_cuda_tier_entry * e = ggml_cuda_tier_find(ptr);
+    if (!e || n_pages <= 0) {
+        return nullptr;
+    }
+    const size_t lo = (CUdeviceptr) ptr - e->va, hi = std::min(e->total, lo + nbytes);
+    size_t a, b;
+    if (!ggml_cuda_tier_host_part(e, lo, hi, &a, &b)) {
+        return nullptr;
+    }
+    // offsets relative to ptr; the kernel copies [lo', hi') of each kept page, lo' = the host part of ptr
+    const char * src = (const char *) ptr;
+    char       * dst = (char *) (e->va2 + lo);
+    const int vec = ((a - lo) | row_bytes | (size_t) src | (size_t) dst) % 16 == 0 ? 16 : 1;
+    k_tier_stage_pages<<<n_pages, 256, 0, stream>>>(src, dst, keep, row_bytes, first_cell, page, a - lo, b - lo, vec);
+    CUDA_CHECK(cudaGetLastError());
+    return dst;
+}
+
+// the cache address of an address in a staging alias (a set_rows redirected there writes these cells), else p
+const void * ggml_cuda_tier_unalias(const void * p) {
+    const CUdeviceptr q = (CUdeviceptr) p;
+    std::lock_guard<std::mutex> lock(g_tier_mutex);
+    for (auto & it : g_tier_entries) {
+        if (it.va2 && q >= it.va2 && q < it.va2 + it.total) {
+            return (const void *) (it.va + (q - it.va2));
+        }
+    }
+    return p;
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * bctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
     const int device   = bctx->device;
@@ -1394,6 +1453,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
                 host_runs.clear();
                 GGML_LOG_WARN("%s: no staging alias for %s: its host tail is read over PCIe in place\n", __func__, bctx->name.c_str());
             } else {
+                // staging is shared and read where masked out (GGML_CUDA_FA_SPARSE stages kept pages only): never
+                // leave bytes there that decode to NaN or Inf
+                for (auto & hr : host_runs) {
+                    cuMemsetD8(va2 + hr.first, 0, hr.second);
+                }
                 ggml_cuda_tier_register(va, va2, total, host_runs);
             }
         }
@@ -1423,6 +1487,15 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
 void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream) {
     GGML_UNUSED(ptr); GGML_UNUSED(nbytes); GGML_UNUSED(stream);
     return nullptr;
+}
+void * ggml_cuda_tier_stage_pages(const void * ptr, size_t nbytes, size_t row_bytes, int64_t first_cell, int page, int n_pages,
+        const uint8_t * keep, cudaStream_t stream) {
+    GGML_UNUSED(ptr); GGML_UNUSED(nbytes); GGML_UNUSED(row_bytes); GGML_UNUSED(first_cell); GGML_UNUSED(page);
+    GGML_UNUSED(n_pages); GGML_UNUSED(keep); GGML_UNUSED(stream);
+    return nullptr;
+}
+const void * ggml_cuda_tier_unalias(const void * p) {
+    return p;
 }
 
 bool ggml_cuda_tier_copy_out(void * dst, const void * ptr, size_t nbytes, cudaStream_t stream) {
@@ -1603,7 +1676,7 @@ static void ggml_cuda_tier_graph_begin(ggml_backend_cuda_context & ctx, ggml_cud
         // ops that take the chunked path (GGML_CUDA_FA_CHUNK) copy their own K/V chunks, never read staging and
         // never call ggml_cuda_tier_fa_begin, so they stay out of the pipeline
         if (prefetch_on && n->op == GGML_OP_FLASH_ATTN_EXT && n->src[1] && n->src[2] && n->src[1] != n->src[2] &&
-                !ggml_cuda_flash_attn_ext_chunked(n) &&
+                !ggml_cuda_flash_attn_ext_chunked(n) && !ggml_cuda_fa_sparse_eligible(n) &&
                 (ggml_cuda_tier_reaches_host(n->src[1]) || ggml_cuda_tier_reaches_host(n->src[2]))) {
             ts.fa.push_back(n);
         }
