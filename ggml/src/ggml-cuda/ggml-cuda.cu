@@ -1170,6 +1170,27 @@ bool ggml_cuda_tier_copy_out(void * dst, const void * ptr, size_t nbytes, cudaSt
     return true;
 }
 
+// offset from ptr of the first host-backed byte of [ptr, ptr + nbytes) in a tiered buffer (staged or not);
+// nbytes when the range is not in a tiered buffer or has no host-backed byte. Used by the K-first stats probe.
+size_t ggml_cuda_tier_first_host(const void * ptr, size_t nbytes) {
+    const CUdeviceptr p = (CUdeviceptr) ptr;
+    std::lock_guard<std::mutex> lock(g_tier_mutex);
+    for (auto & s : g_tier_spans) {
+        if (p >= s.va && p < s.va + s.total) {
+            const size_t lo = p - s.va, hi = std::min(s.total, lo + nbytes);
+            size_t first = nbytes;
+            for (auto & rr : s.runs) {
+                const size_t a = std::max(lo, rr.off), b = std::min(hi, rr.off + rr.len);
+                if (rr.host && a < b) {
+                    first = std::min(first, a - lo);
+                }
+            }
+            return first;
+        }
+    }
+    return nbytes;
+}
+
 // VRAM staging buffers shared by the tiered buffers of one KV cache: slot i backs the i-th host run (K tail, V
 // tail). The layers of a cache run one after another on one stream, so they can share them; another cache (the MTP
 // draft context's) runs on its own stream and can overlap with this one's work, so it gets its own. The cache is
@@ -1418,6 +1439,11 @@ void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream
 bool ggml_cuda_tier_copy_out(void * dst, const void * ptr, size_t nbytes, cudaStream_t stream) {
     GGML_UNUSED(dst); GGML_UNUSED(ptr); GGML_UNUSED(nbytes); GGML_UNUSED(stream);
     return false;
+}
+
+size_t ggml_cuda_tier_first_host(const void * ptr, size_t nbytes) {
+    GGML_UNUSED(ptr);
+    return nbytes;
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_type_t buft, size_t size) {

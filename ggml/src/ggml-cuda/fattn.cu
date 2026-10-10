@@ -822,6 +822,11 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
+    // stats only: extra kernels and a stream sync, the attention below is unchanged
+    if (ggml_cuda_kfirst_stats_enabled()) {
+        ggml_cuda_kfirst_probe(ctx, dst);
+    }
+
     // GGML_CUDA_FA_CHUNK: this op copies its own K/V chunks from the original addresses (no whole-op staging; the
     // tier prefetch leaves these ops out, see ggml_cuda_tier_graph_begin)
     if (ggml_cuda_flash_attn_ext_chunked(dst)) {

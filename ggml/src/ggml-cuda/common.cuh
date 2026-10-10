@@ -1391,7 +1391,9 @@ struct ggml_cuda_graph {
     std::vector<node_properties> node_props;
 
     bool is_enabled() const {
-        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+        // the K-first stats probe (fattn-kfirst.cu) synchronizes the stream, which a graph capture cannot do
+        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr) ||
+            (getenv("GGML_CUDA_KV_TIER_KFIRST_STATS") != nullptr && atoi(getenv("GGML_CUDA_KV_TIER_KFIRST_STATS")) != 0);
         return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
     }
 #endif
