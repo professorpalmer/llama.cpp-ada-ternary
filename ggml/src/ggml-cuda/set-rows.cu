@@ -258,6 +258,15 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_Q4_0) {
+        static const int fake_bits = [] {
+            const char * e = getenv("GGML_CUDA_KV_FAKE_BITS");
+            return e ? atoi(e) : 0;
+        }();
+        static int fake_bits_set = -1;   // per process; one device is enough for this test
+        if (fake_bits_set != fake_bits) {
+            CUDA_CHECK(cudaMemcpyToSymbol(g_kv_fake_bits, &fake_bits, sizeof(int)));
+            fake_bits_set = fake_bits;
+        }
         set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
             src0_d, src1_d, (block_q4_0*)dst->data,
             ne00, ne01, ne02, ne03,
