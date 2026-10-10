@@ -14,6 +14,10 @@ static __device__ __forceinline__ int best_index_int8(int n, const int8_t * val,
     return x - val[mu-1] < val[mu] - x ? mu-1 : mu;
 }
 
+// Test only (GGML_CUDA_KV_FAKE_BITS=3 or 2, set by set-rows.cu): K/V rows written by set_rows keep only 2^b levels of
+// the q4_0 grid, to measure what a b-bit KV format would cost in quality. 0 = normal q4_0.
+static __device__ int g_kv_fake_bits = 0;
+
 static __device__ void quantize_f32_q4_0_block(const float * __restrict__ x, block_q4_0 * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;
@@ -24,6 +28,23 @@ static __device__ void quantize_f32_q4_0_block(const float * __restrict__ x, blo
             amax = fabsf(v);
             vmax = v;
         }
+    }
+
+    const int fake_bits = g_kv_fake_bits;
+    if (fake_bits == 2 || fake_bits == 3) {
+        // levels -L/2 .. L/2-1 with step dk; stored as q4_0 index s*k + 8 with d = dk/s (s = 16/L), same values
+        const int   half = fake_bits == 3 ? 4 : 2;
+        const int   s    = 8 / half;
+        const float dk   = vmax / -half;
+        const float idk  = dk ? 1.0f/dk : 0.0f;
+        y->d = dk / s;
+        for (int j = 0; j < QK4_0/2; ++j) {
+            const int k0 = max(-half, min(half - 1, (int) floorf(x[0       + j]*idk + 0.5f)));
+            const int k1 = max(-half, min(half - 1, (int) floorf(x[QK4_0/2 + j]*idk + 0.5f)));
+            y->qs[j]  = (uint8_t) (s*k0 + 8);
+            y->qs[j] |= (uint8_t) ((s*k1 + 8) << 4);
+        }
+        return;
     }
 
     const float d  = vmax / -8;
