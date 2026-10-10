@@ -6,6 +6,9 @@
 #include "fattn.cuh"
 
 #include <cmath>
+#include <atomic>
+#include <map>
+#include <mutex>
 #include <unordered_map>
 
 template <int DKQ, int DV, int ncols2, ggml_type type_KV = GGML_TYPE_F16>
@@ -632,6 +635,8 @@ int64_t ggml_cuda_tier_first_host_cell(const ggml_tensor * t);
 struct fa_sparse_cfg {
     int64_t budget = 0, page = 64, recent = 1024;
     bool    fast = false;   // GGML_CUDA_FA_SPARSE_FAST=1: decode-sized ops only (<= 8 queries), page bounds cached
+    bool    check   = false;   // GGML_CUDA_FA_SPARSE_CHECK=1 (debug): fast mode also recomputes every page, logs stale ones
+    bool    notrack = false;   // GGML_CUDA_FA_SPARSE_NOTRACK=1 (debug): writes do not invalidate cached bounds
 };
 
 static const fa_sparse_cfg & fa_sparse() {
@@ -646,9 +651,110 @@ static const fa_sparse_cfg & fa_sparse() {
         }
         const char * f = getenv("GGML_CUDA_FA_SPARSE_FAST");
         r.fast = f && atoi(f) != 0;
+        const char * c = getenv("GGML_CUDA_FA_SPARSE_CHECK");
+        r.check = c && atoi(c) != 0;
+        const char * n = getenv("GGML_CUDA_FA_SPARSE_NOTRACK");
+        r.notrack = n && atoi(n) != 0;
         return r;
     }();
     return c;
+}
+
+// Fast mode: page-bound tables kept across ops, one per K cache tensor (key: the K data address the attention views start
+// at). A write into a tracked K tensor lowers `valid` to the first host cell it can touch, and the next attention op
+// recomputes the bounds from that page on: set_rows of new cells (exact rows, from the index tensor), any other op that
+// writes into it, and buffer writes (state loads, copies, clears, frees) from their first byte on.
+struct fa_sparse_table {
+    float * mx = nullptr; float * mn = nullptr; int cap = 0; int64_t first = -1; int64_t valid = 0;
+    const char * end = nullptr; size_t row = 0;
+};
+static std::mutex                                fa_sparse_mtx;
+static std::map<const char *, fa_sparse_table>   fa_sparse_tables;
+static std::atomic<uintptr_t>                    fa_sparse_lo{UINTPTR_MAX}, fa_sparse_hi{0};
+
+// the bytes [p, p + n) may have changed: in each table that holds some of them, the host cells from the first written
+// one on. rows: the rows a set_rows wrote, relative to p, when its rows (row_bytes) match the table's (else every row of
+// [p, p + n) counts as written). Writes that end before the host tail change nothing. Call with fa_sparse_mtx held.
+static void fa_sparse_dirty_locked(const char * p, size_t n, const std::vector<int64_t> * rows = nullptr, size_t row_bytes = 0) {
+    for (auto & [base, t] : fa_sparse_tables) {
+        if (n == 0 || p + n <= base || p >= t.end || t.row == 0) {
+            continue;
+        }
+        const int64_t r0 = p <= base ? 0 : (int64_t) ((size_t) (p - base)/t.row);
+        int64_t lo = INT64_MAX;
+        if (rows && p >= base && row_bytes == t.row) {
+            for (const int64_t r : *rows) {
+                if (r0 + r >= t.first) {
+                    lo = std::min(lo, r0 + r);
+                }
+            }
+        } else {
+            const int64_t r1 = (int64_t) ((size_t) (std::min(p + n, t.end) - 1 - base)/t.row);
+            if (r1 >= t.first) {
+                lo = std::max(r0, t.first);
+            }
+        }
+        if (lo != INT64_MAX) {
+            t.valid = std::min<int64_t>(t.valid, lo - t.first);
+        }
+    }
+}
+
+static bool fa_sparse_maybe_tracked(const void * p, size_t n) {
+    const uintptr_t a = (uintptr_t) p;
+    return a < fa_sparse_hi.load(std::memory_order_relaxed) && a + n > fa_sparse_lo.load(std::memory_order_relaxed);
+}
+
+// buffer-level writes (ggml-cuda.cu: set_tensor, memset, copies, clear, free): everything from p on
+void ggml_cuda_fa_sparse_note_bytes(const void * p, size_t n) {
+    if (!fa_sparse_maybe_tracked(p, n) || fa_sparse().notrack) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(fa_sparse_mtx);
+    fa_sparse_dirty_locked((const char *) p, n);
+}
+
+// after each op (ggml_cuda_compute_forward): an op whose result lands in a tracked K tensor
+void ggml_cuda_fa_sparse_note_op(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    if (!dst->data || !fa_sparse_maybe_tracked(dst->data, ggml_nbytes(dst)) || fa_sparse().notrack) {
+        return;
+    }
+    const char * p = (const char *) dst->data;
+    const ggml_tensor * idx = dst->src[1];
+    std::vector<int64_t> rows;
+    if (dst->op == GGML_OP_SET_ROWS && dst->ne[2] == 1 && dst->ne[3] == 1 && idx && ggml_is_contiguous(idx) &&
+            (idx->type == GGML_TYPE_I64 || idx->type == GGML_TYPE_I32) && ggml_nelements(idx) > 0) {
+        // exact: the rows this set_rows wrote (decode: one cell per layer, one small copy and a sync)
+        const int64_t ni = ggml_nelements(idx);
+        std::vector<int64_t> & h = rows;
+        h.resize((size_t) ni);
+        if (idx->type == GGML_TYPE_I64) {
+            CUDA_CHECK(cudaMemcpyAsync(h.data(), idx->data, ni*sizeof(int64_t), cudaMemcpyDefault, ctx.stream()));
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        } else {
+            std::vector<int32_t> h32((size_t) ni);
+            CUDA_CHECK(cudaMemcpyAsync(h32.data(), idx->data, ni*sizeof(int32_t), cudaMemcpyDefault, ctx.stream()));
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            std::copy(h32.begin(), h32.end(), h.begin());
+        }
+    }
+    std::lock_guard<std::mutex> lock(fa_sparse_mtx);
+    fa_sparse_dirty_locked(p, ggml_nbytes(dst), rows.empty() ? nullptr : &rows, (size_t) dst->nb[1]);
+}
+
+// debug (GGML_CUDA_FA_SPARSE_CHECK): pages whose cached bounds differ from freshly computed ones
+static __global__ void fa_sparse_diff(const float * __restrict__ a_mx, const float * __restrict__ a_mn, const int a_stride,
+        const float * __restrict__ b_mx, const float * __restrict__ b_mn, const int b_stride, const int D, int * __restrict__ bad) {
+    const int p = blockIdx.x, h = blockIdx.y;
+    bool diff = false;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        const int64_t ia = ((int64_t) h*a_stride + p)*D + d, ib = ((int64_t) h*b_stride + p)*D + d;
+        diff = diff || a_mx[ia] != b_mx[ib] || a_mn[ia] != b_mn[ib];
+    }
+    if (__syncthreads_or(diff) && threadIdx.x == 0) {
+        atomicAdd(bad, 1);
+        atomicMin(bad + 1, p);
+    }
 }
 
 // per page and KV head: max and min over the page's cells of each K dimension (K as contiguous f16 [D, n_cells, H_kv])
@@ -791,11 +897,8 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     mask_buf.alloc((size_t) m_s1*m_rows);
 
     // page bounds: [H_kv][stride_pages][D] max and min. Emulation: all host pages, every op. Fast mode: a table per K tensor
-    // kept across ops, filled once, then only the pages of the last `recent + page` cells are recomputed (append-only
-    // conversations write new cells there, and those cells are always kept anyway). Edits deep in a prompt are not
-    // tracked yet (prototype: no invalidation on writes).
-    struct bounds_table { float * mx = nullptr; float * mn = nullptr; int cap = 0; int64_t first = -1; int64_t valid = 0; };
-    static std::unordered_map<const void *, bounds_table> tables;
+    // kept across ops (fa_sparse_tables), filled once, then only the pages from the first written cell (writes lower
+    // `valid`) or of the last `recent + page` cells, whichever is lower, are recomputed.
     ggml_cuda_pool_alloc<float> mx_tmp(ctx.pool()), mn_tmp(ctx.pool());
     const float * mx = nullptr;
     const float * mn = nullptr;
@@ -803,8 +906,15 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     int p_from = 0;   // first page to (re)compute
     float * mx_w = nullptr;
     float * mn_w = nullptr;
+    std::unique_lock<std::mutex> tbl_lock(fa_sparse_mtx, std::defer_lock);
     if (cfg.fast) {
-        bounds_table & t = tables[K->data];
+        tbl_lock.lock();
+        fa_sparse_table & t = fa_sparse_tables[(const char *) K->data];
+        const ggml_tensor * Ks = K->view_src ? K->view_src : K;
+        t.end = (const char *) Ks->data + ggml_nbytes(Ks);
+        t.row = K->nb[1];
+        fa_sparse_lo.store(std::min<uintptr_t>(fa_sparse_lo.load(), (uintptr_t) K->data));
+        fa_sparse_hi.store(std::max<uintptr_t>(fa_sparse_hi.load(), (uintptr_t) t.end));
         if (t.first != first || t.cap < n_pages) {
             const int cap = std::max(n_pages, t.cap) + 64;
             if (t.mx) {
@@ -821,6 +931,7 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
         t.valid = n_host;
         stride_pages = t.cap;
         mx_w = t.mx; mn_w = t.mn;
+        tbl_lock.unlock();
     } else {
         mx_tmp.alloc((size_t) H_kv*n_pages*D);
         mn_tmp.alloc((size_t) H_kv*n_pages*D);
@@ -838,6 +949,32 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
         fa_sparse_bounds<<<dim3(n_pages - p_from, H_kv), 256, 0, stream>>>(Kh.get(), mx_w, mn_w, D, (int) n_cells, page, p_from, stride_pages);
     }
     mx = mx_w; mn = mn_w;
+    if (cfg.fast && cfg.check) {
+        // recompute every host page into temporaries and count the cached pages that differ
+        ggml_cuda_pool_alloc<half>  Kf(ctx.pool(), (size_t) D*n_host*H_kv);
+        ggml_cuda_pool_alloc<float> fmx(ctx.pool(), (size_t) H_kv*n_pages*D), fmn(ctx.pool(), (size_t) H_kv*n_pages*D);
+        ggml_cuda_pool_alloc<int>   d_bad(ctx.pool(), 2);
+        const size_t ts = ggml_type_size(K->type);
+        ggml_get_to_fp16_nc_cuda(K->type)((const char *) K->data + first*K->nb[1], Kf.get(), D, n_host, H_kv, 1,
+            K->nb[1]/ts, K->nb[2]/ts, K->nb[3]/ts, stream);
+        fa_sparse_bounds<<<dim3(n_pages, H_kv), 256, 0, stream>>>(Kf.get(), fmx.get(), fmn.get(), D, (int) n_host, page, 0, n_pages);
+        const int init[2] = {0, INT_MAX};
+        CUDA_CHECK(cudaMemcpyAsync(d_bad.get(), init, sizeof(init), cudaMemcpyHostToDevice, stream));
+        fa_sparse_diff<<<dim3(n_pages, H_kv), 256, 0, stream>>>(mx, mn, stride_pages, fmx.get(), fmn.get(), n_pages, D, d_bad.get());
+        int bad[2];
+        CUDA_CHECK(cudaMemcpyAsync(bad, d_bad.get(), sizeof(bad), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        static int64_t ck_ops = 0, ck_bad_ops = 0;
+        ++ck_ops;
+        if (bad[0] > 0) {
+            ++ck_bad_ops;
+            GGML_LOG_WARN("%s: CHECK stale bounds: K %p, %d page-heads of %d differ, first page %d (n_host %lld, pages %d, from %d)\n",
+                __func__, K->data, bad[0], n_pages*H_kv, bad[1], (long long) n_host, n_pages, p_from);
+        }
+        if (ck_ops % 4096 == 0) {
+            GGML_LOG_INFO("%s: CHECK %lld ops, %lld with stale bounds\n", __func__, (long long) ck_ops, (long long) ck_bad_ops);
+        }
+    }
     ggml_cuda_pool_alloc<float> ub(ctx.pool(), (size_t) n_q*n_pages);
     fa_sparse_scores<<<dim3(n_pages, n_q), 256, 0, stream>>>((const float *) Q->data, mx, mn, ub.get(), D, n_pages,
         n_head, gqa, (int64_t) (Q->nb[1]/sizeof(float)), (int64_t) (Q->nb[2]/sizeof(float)), stride_pages);
