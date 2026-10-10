@@ -257,6 +257,23 @@ static __global__ void flash_attn_ext_vec(
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
+        // A tile whose mask is -inf for every cell and every column adds exp(-inf) = 0 to the sums and does not move
+        // the maximum, so it can be skipped without reading its K/V rows; with GGML_CUDA_FA_SPARSE this is what
+        // keeps unselected host-tail pages off the PCIe link. Exact: the result is the same as processing the tile.
+        if (mask) {
+            const int i_tile = threadIdx.y*WARP_SIZE + threadIdx.x;
+            bool visible = false;
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                    visible = visible || !isinf(__half2float(maskh[j*ne11 + i_tile]));
+                }
+            }
+            if (!__syncthreads_or(visible)) {
+                continue;
+            }
+        }
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
 
