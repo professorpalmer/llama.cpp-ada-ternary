@@ -1464,6 +1464,20 @@ static bool ggml_cuda_tier_host_part(const ggml_cuda_tier_entry * e, size_t lo, 
     return false;
 }
 
+// first cell (row nb[1]) of t that lives in a host run of its tiered buffer, -1 when none (GGML_CUDA_FA_SPARSE)
+int64_t ggml_cuda_tier_first_host_cell(const ggml_tensor * t) {
+    const ggml_cuda_tier_entry * e = ggml_cuda_tier_find(t->data);
+    if (!e) {
+        return -1;
+    }
+    const size_t lo = (CUdeviceptr) t->data - e->va;
+    size_t a, b;
+    if (!ggml_cuda_tier_host_part(e, lo, std::min(e->total, lo + ggml_nbytes(t)), &a, &b)) {
+        return -1;
+    }
+    return (int64_t) ((a - lo) / t->nb[1]);
+}
+
 static bool ggml_cuda_tier_reaches_host(const ggml_tensor * t) {
     const ggml_cuda_tier_entry * e = ggml_cuda_tier_find(t->data);
     if (!e) {
@@ -1685,6 +1699,10 @@ bool ggml_cuda_tier_fa_begin(ggml_backend_cuda_context & ctx, const ggml_tensor 
 }
 void ggml_cuda_tier_fa_end(ggml_backend_cuda_context & ctx) {
     GGML_UNUSED(ctx);
+}
+int64_t ggml_cuda_tier_first_host_cell(const ggml_tensor * t) {
+    GGML_UNUSED(t);
+    return -1;
 }
 #endif
 
