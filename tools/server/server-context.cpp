@@ -1527,6 +1527,19 @@ private:
         return nullptr;
     }
 
+    // LLAMA_SLOT_KEEP_TOKENS=N (with several slots): a slot that holds more than N cached tokens is chosen by prompt
+    // similarity only when the new prompt keeps at least half of them; otherwise the request goes to another available
+    // slot, the one with the fewest cached tokens. A short side request (an agent client's title request shares the
+    // chat template prefix) then no longer replaces a deep conversation whose state is too big for the prompt cache,
+    // which made the next turn read the whole prompt again. Unset or 0: off (similarity, then LRU, as before).
+    static int64_t slot_keep_tokens() {
+        static const int64_t n = [] {
+            const char * e = getenv("LLAMA_SLOT_KEEP_TOKENS");
+            return e ? (int64_t) atoll(e) : (int64_t) 0;
+        }();
+        return n;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1567,6 +1580,12 @@ private:
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
                 const float f_sim_cur = float(lcp_len) / task.tokens.size();
 
+                if (slot_keep_tokens() > 0 && task.id_slot == -1 && slots.size() > 1 &&
+                        (int64_t) tokens.size() > slot_keep_tokens() && 2*lcp_len < tokens.size()) {
+                    SLT_TRC(slot, " - skipping, the prompt keeps %zu of its %zu cached tokens (LLAMA_SLOT_KEEP_TOKENS)\n", lcp_len, tokens.size());
+                    continue;
+                }
+
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
                 // select the current slot if the criteria match
@@ -1595,6 +1614,9 @@ private:
         // find the slot that has been least recently used
         if (ret == nullptr) {
             int64_t t_last = -1;
+            // LLAMA_SLOT_KEEP_TOKENS: the available slot with the fewest cached tokens (then the least recently used)
+            const bool keep_large = slot_keep_tokens() > 0 && task.id_slot == -1 && slots.size() > 1;
+            size_t n_best = 0;
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
@@ -1603,8 +1625,11 @@ private:
                 }
 
                 // select the current slot if the criteria match
-                if (!ret || slot.t_last_used <= t_last) {
+                const size_t n_cur = slot.prompt.tokens.size();
+                if (keep_large ? (!ret || n_cur < n_best || (n_cur == n_best && slot.t_last_used <= t_last))
+                               : (!ret || slot.t_last_used <= t_last)) {
                     t_last = slot.t_last_used;
+                    n_best = n_cur;
                     ret = &slot;
                 }
             }
