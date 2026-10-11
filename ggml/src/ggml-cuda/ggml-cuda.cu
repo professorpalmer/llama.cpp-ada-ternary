@@ -842,6 +842,7 @@ bool ggml_cuda_fa_sparse_eligible(const ggml_tensor * fa);
 // GGML_CUDA_FA_SPARSE_FAST (fattn.cu): writes into a K cache tensor invalidate its cached page bounds
 void ggml_cuda_fa_sparse_note_bytes(const void * p, size_t n);
 void ggml_cuda_fa_sparse_note_op(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+void ggml_cuda_fa_sparse_note_input(const ggml_tensor * t, const void * data, size_t offset, size_t size);
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
@@ -891,6 +892,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    ggml_cuda_fa_sparse_note_input(tensor, data, offset, size);
     ggml_cuda_fa_sparse_note_bytes((char *) tensor->data + offset, size);
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));

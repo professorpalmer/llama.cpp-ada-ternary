@@ -737,6 +737,24 @@ void ggml_cuda_fa_sparse_note_bytes(const void * p, size_t n) {
 }
 
 // after each op (ggml_cuda_compute_forward): an op whose result lands in a tracked K tensor
+// graph inputs of index type set from the host (ggml-cuda.cu: buffer set_tensor), by device address: set_rows reads its
+// rows from these without a device-to-host copy (llama sets the K/V cell indices as graph inputs before each compute)
+static std::unordered_map<const void *, std::vector<int64_t>> fa_sparse_inputs;
+
+void ggml_cuda_fa_sparse_note_input(const ggml_tensor * t, const void * data, size_t offset, size_t size) {
+    if (fa_sparse().budget <= 0 || !fa_sparse().fast || !(t->flags & GGML_TENSOR_FLAG_INPUT) || offset != 0 ||
+            size != ggml_nbytes(t) || size > (1u << 20) || (t->type != GGML_TYPE_I64 && t->type != GGML_TYPE_I32)) {
+        return;
+    }
+    const int64_t n = ggml_nelements(t);
+    std::lock_guard<std::mutex> lock(fa_sparse_mtx);
+    std::vector<int64_t> & v = fa_sparse_inputs[t->data];
+    v.resize((size_t) n);
+    for (int64_t k = 0; k < n; ++k) {
+        v[k] = t->type == GGML_TYPE_I64 ? ((const int64_t *) data)[k] : ((const int32_t *) data)[k];
+    }
+}
+
 void ggml_cuda_fa_sparse_note_op(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     // a set_rows redirected into the staging alias (the prefetch pipeline) writes the same cells as the cache itself
     const void * d = dst->data ? ggml_cuda_tier_unalias(dst->data) : nullptr;
@@ -744,22 +762,47 @@ void ggml_cuda_fa_sparse_note_op(ggml_backend_cuda_context & ctx, const ggml_ten
         return;
     }
     const char * p = (const char *) d;
+    {
+        // only writes into a tracked K tensor matter (the address range also covers the V tensors between them)
+        std::lock_guard<std::mutex> lock(fa_sparse_mtx);
+        bool hit = false;
+        for (auto & [base, t] : fa_sparse_tables) {
+            hit = hit || (p + ggml_nbytes(dst) > base && p < t.end);
+        }
+        if (!hit) {
+            return;
+        }
+    }
     const ggml_tensor * idx = dst->src[1];
     std::vector<int64_t> rows;
     if (dst->op == GGML_OP_SET_ROWS && dst->ne[2] == 1 && dst->ne[3] == 1 && idx && ggml_is_contiguous(idx) &&
             (idx->type == GGML_TYPE_I64 || idx->type == GGML_TYPE_I32) && ggml_nelements(idx) > 0) {
-        // exact: the rows this set_rows wrote (decode: one cell per layer, one small copy and a sync)
+        // exact: the rows this set_rows wrote, from the host copy of the index input when there is one, else one
+        // small device-to-host copy and a sync
         const int64_t ni = ggml_nelements(idx);
-        std::vector<int64_t> & h = rows;
-        h.resize((size_t) ni);
-        if (idx->type == GGML_TYPE_I64) {
-            CUDA_CHECK(cudaMemcpyAsync(h.data(), idx->data, ni*sizeof(int64_t), cudaMemcpyDefault, ctx.stream()));
-            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
-        } else {
-            std::vector<int32_t> h32((size_t) ni);
-            CUDA_CHECK(cudaMemcpyAsync(h32.data(), idx->data, ni*sizeof(int32_t), cudaMemcpyDefault, ctx.stream()));
-            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
-            std::copy(h32.begin(), h32.end(), h.begin());
+        {
+            std::lock_guard<std::mutex> lock(fa_sparse_mtx);
+            auto it = fa_sparse_inputs.find(idx->data);
+            if ((idx->flags & GGML_TENSOR_FLAG_INPUT) && it != fa_sparse_inputs.end() && (int64_t) it->second.size() == ni) {
+                rows = it->second;
+            }
+        }
+        if (rows.empty()) {
+            static bool warned = false;
+            if (!warned) {
+                GGML_LOG_WARN("%s: GGML_CUDA_FA_SPARSE_FAST: set_rows indices are not a host-set input: one sync per K write\n", __func__);
+                warned = true;
+            }
+            rows.resize((size_t) ni);
+            if (idx->type == GGML_TYPE_I64) {
+                CUDA_CHECK(cudaMemcpyAsync(rows.data(), idx->data, ni*sizeof(int64_t), cudaMemcpyDefault, ctx.stream()));
+                CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            } else {
+                std::vector<int32_t> h32((size_t) ni);
+                CUDA_CHECK(cudaMemcpyAsync(h32.data(), idx->data, ni*sizeof(int32_t), cudaMemcpyDefault, ctx.stream()));
+                CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+                std::copy(h32.begin(), h32.end(), rows.begin());
+            }
         }
     }
     std::lock_guard<std::mutex> lock(fa_sparse_mtx);
