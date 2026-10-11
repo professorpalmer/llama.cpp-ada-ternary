@@ -737,25 +737,41 @@ void ggml_cuda_fa_sparse_note_bytes(const void * p, size_t n) {
 }
 
 // after each op (ggml_cuda_compute_forward): an op whose result lands in a tracked K tensor
-// graph inputs of index type set from the host (ggml-cuda.cu: buffer set_tensor), by device address: set_rows reads its
-// rows from these without a device-to-host copy (llama sets the K/V cell indices as graph inputs before each compute)
+// host copies of small index tensors written from the host (buffer set_tensor, backend set_tensor_async), by device
+// address: set_rows reads its rows from these without a device-to-host copy. The scheduler copies llama's cell
+// indices to the device this way. Any other write to the same address (a non-index set, or a device op that writes
+// an index tensor there) drops the entry, so a stale copy is never used.
 static std::unordered_map<const void *, std::vector<int64_t>> fa_sparse_inputs;
+static std::atomic<bool> fa_sparse_inputs_any{false};
 
 void ggml_cuda_fa_sparse_note_input(const ggml_tensor * t, const void * data, size_t offset, size_t size) {
-    if (fa_sparse().budget <= 0 || !fa_sparse().fast || !(t->flags & GGML_TENSOR_FLAG_INPUT) || offset != 0 ||
-            size != ggml_nbytes(t) || size > (1u << 20) || (t->type != GGML_TYPE_I64 && t->type != GGML_TYPE_I32)) {
+    if (fa_sparse().budget <= 0 || !fa_sparse().fast || !t->data) {
+        return;
+    }
+    const bool index = (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) && offset == 0 && size == ggml_nbytes(t) &&
+        size <= (1u << 20);
+    std::lock_guard<std::mutex> lock(fa_sparse_mtx);
+    if (!index) {
+        if (fa_sparse_inputs_any.load(std::memory_order_relaxed)) {
+            fa_sparse_inputs.erase((const char *) t->data + offset);
+        }
         return;
     }
     const int64_t n = ggml_nelements(t);
-    std::lock_guard<std::mutex> lock(fa_sparse_mtx);
     std::vector<int64_t> & v = fa_sparse_inputs[t->data];
     v.resize((size_t) n);
     for (int64_t k = 0; k < n; ++k) {
         v[k] = t->type == GGML_TYPE_I64 ? ((const int64_t *) data)[k] : ((const int32_t *) data)[k];
     }
+    fa_sparse_inputs_any.store(true, std::memory_order_relaxed);
 }
 
 void ggml_cuda_fa_sparse_note_op(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    if (fa_sparse_inputs_any.load(std::memory_order_relaxed) && dst->data &&
+            (dst->type == GGML_TYPE_I64 || dst->type == GGML_TYPE_I32)) {
+        std::lock_guard<std::mutex> lock(fa_sparse_mtx);
+        fa_sparse_inputs.erase(dst->data);   // a device op wrote an index tensor here: the host copy is stale
+    }
     // a set_rows redirected into the staging alias (the prefetch pipeline) writes the same cells as the cache itself
     const void * d = dst->data ? ggml_cuda_tier_unalias(dst->data) : nullptr;
     if (!d || !fa_sparse_maybe_tracked(d, ggml_nbytes(dst)) || fa_sparse().notrack) {
@@ -783,14 +799,14 @@ void ggml_cuda_fa_sparse_note_op(ggml_backend_cuda_context & ctx, const ggml_ten
         {
             std::lock_guard<std::mutex> lock(fa_sparse_mtx);
             auto it = fa_sparse_inputs.find(idx->data);
-            if ((idx->flags & GGML_TENSOR_FLAG_INPUT) && it != fa_sparse_inputs.end() && (int64_t) it->second.size() == ni) {
+            if (it != fa_sparse_inputs.end() && (int64_t) it->second.size() == ni) {
                 rows = it->second;
             }
         }
         if (rows.empty()) {
             static bool warned = false;
             if (!warned) {
-                GGML_LOG_WARN("%s: GGML_CUDA_FA_SPARSE_FAST: set_rows indices are not a host-set input: one sync per K write\n", __func__);
+                GGML_LOG_WARN("%s: GGML_CUDA_FA_SPARSE_FAST: set_rows indices were not written from the host: one sync per K write\n", __func__);
                 warned = true;
             }
             rows.resize((size_t) ni);

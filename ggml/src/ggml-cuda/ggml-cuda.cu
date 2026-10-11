@@ -3307,6 +3307,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(ggml_backend_buft_is_cuda(buf->buft) && ((ggml_backend_cuda_buffer_type_context *) buf->buft->context)->device == cuda_ctx->device && "unsupported buffer type");
 
+    ggml_cuda_fa_sparse_note_input(tensor, data, offset, size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -5653,9 +5654,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (++n_graphs % 100 == 0) {
                     std::vector<std::pair<std::string, acc>> v(totals.begin(), totals.end());
                     std::sort(v.begin(), v.end(), [](auto & x, auto & y) { return x.second.ms > y.second.ms; });
-                    GGML_LOG_INFO("op timing over %lld graphs: %.3f ms per graph\n", (long long) n_graphs, ms_graphs / n_graphs);
+                    GGML_LOG_WARN("op timing over %lld graphs: %.3f ms per graph\n", (long long) n_graphs, ms_graphs / n_graphs);
                     for (size_t k = 0; k < v.size() && k < 30; ++k) {
-                        GGML_LOG_INFO("  %8.3f ms/graph %6.1f%%  x%-5lld %s\n", v[k].second.ms / n_graphs,
+                        GGML_LOG_WARN("  %8.3f ms/graph %6.1f%%  x%-5lld %s\n", v[k].second.ms / n_graphs,
                             100.0 * v[k].second.ms / ms_graphs, (long long) (v[k].second.n / n_graphs), v[k].first.c_str());
                     }
                     totals.clear();
