@@ -1231,6 +1231,8 @@ void launch_fattn(
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
     static const bool tile_skip = [] { const char * e = getenv("GGML_CUDA_FA_TILE_SKIP"); return e && atoi(e) != 0; }();
+    // GGML_CUDA_FA_V_SKIP=1: the vec kernel skips the V rows of 32-cell groups whose weights are all below exp(-20)
+    static const bool v_skip = [] { const char * e = getenv("GGML_CUDA_FA_V_SKIP"); return e && atoi(e) != 0; }();
     bool tile_vis = false;
     if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || (tile_skip && !mask_packed && !chunk))) {
         const size_t  es  = mask_packed ? sizeof(uint32_t) : sizeof(half2);
@@ -1389,7 +1391,7 @@ void launch_fattn(
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        (mask_packed ? 1 : 0) | (chunk ? 2 : 0) | (tile_vis ? 4 : 0)   // 2: chunk launch, 4: tile visibility map (fattn-mma-f16.cuh)
+        (mask_packed ? 1 : 0) | (chunk ? 2 : 0) | (tile_vis ? 4 : 0) | (v_skip ? 8 : 0)   // 2: chunk launch, 4: tile visibility map (fattn-mma-f16.cuh), 8: V skip (fattn-vec.cuh)
     );
     CUDA_CHECK(cudaGetLastError());
 
