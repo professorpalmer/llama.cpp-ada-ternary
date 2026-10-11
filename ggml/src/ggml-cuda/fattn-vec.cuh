@@ -273,6 +273,12 @@ static __global__ void flash_attn_ext_vec(
             if (!__syncthreads_or(visible)) {
                 continue;
             }
+            // each warp owns 32 cells of the tile for both KQ and V (warp-level sync only below), so a warp whose
+            // cells are all masked skips them too: with 64-cell sparse pages a kept page no longer pulls in its
+            // neighbour's rows. Exact, like the tile skip.
+            if (!__any_sync(0xFFFFFFFF, visible)) {
+                continue;
+            }
         }
 
         // Calculate KQ tile and keep track of new maximum KQ values:
