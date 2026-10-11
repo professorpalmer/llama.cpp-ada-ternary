@@ -638,6 +638,7 @@ const void * ggml_cuda_tier_unalias(const void * p);
 struct fa_sparse_cfg {
     int64_t budget = 0, page = 64, recent = 1024;
     int     maxq = 64;   // GGML_CUDA_FA_SPARSE_MAXQ: fast mode takes ops of up to this many queries (decode, draft verify)
+    int64_t sinks = -1;  // GGML_CUDA_FA_SPARSE_SINKS=N: select pages from cell N on, the VRAM part too (-1: host tail only)
     bool    fast = false;   // GGML_CUDA_FA_SPARSE_FAST=1: decode-sized ops only (<= 8 queries), page bounds cached
     bool    check   = false;   // GGML_CUDA_FA_SPARSE_CHECK=1 (debug): fast mode also recomputes every page, logs stale ones
     bool    notrack = false;   // GGML_CUDA_FA_SPARSE_NOTRACK=1 (debug): writes do not invalidate cached bounds
@@ -661,6 +662,8 @@ static const fa_sparse_cfg & fa_sparse() {
         r.notrack = n && atoi(n) != 0;
         const char * mq = getenv("GGML_CUDA_FA_SPARSE_MAXQ");
         r.maxq = mq ? std::max(1, atoi(mq)) : 64;
+        const char * sk = getenv("GGML_CUDA_FA_SPARSE_SINKS");
+        r.sinks = sk ? std::max(0, atoi(sk)) : -1;
         return r;
     }();
     return c;
@@ -719,7 +722,10 @@ bool ggml_cuda_fa_sparse_eligible(const ggml_tensor * fa) {
     if (cfg.budget <= 0 || !cfg.fast || !K || !M || M->type != GGML_TYPE_F16 || Q->ne[1] > cfg.maxq) {
         return false;
     }
-    const int64_t first = ggml_cuda_tier_first_host_cell(K);
+    // the selected region: the host tail, or with GGML_CUDA_FA_SPARSE_SINKS every cell from the sinks on (the op must
+    // still reach the host tail, so short contexts stay dense)
+    const int64_t first_host = ggml_cuda_tier_first_host_cell(K);
+    const int64_t first = first_host >= 0 && cfg.sinks >= 0 ? std::min<int64_t>(cfg.sinks, first_host) : first_host;
     if (first < 0 || first >= K->ne[1]) {
         return false;
     }
@@ -971,7 +977,8 @@ static __global__ void fa_sparse_apply(half * __restrict__ mask, const uint8_t *
 // returns true when the op runs with a sparse copy of its mask in *mask_out (backed by mask_buf)
 // the host-tail pages that at least one query of the op keeps (for staging only those, ggml_cuda_tier_stage_pages)
 struct fa_sparse_pages {
-    int64_t         first   = -1;   // first host cell of K
+    int64_t         first   = -1;   // first cell of the selected region (page 0)
+    int64_t         first_host = -1;   // first host cell of K (V must match for page staging)
     int             page    = 0;
     int             n_pages = 0;
     const uint8_t * keep    = nullptr;   // [n_pages] on the device
@@ -1011,7 +1018,10 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
         }
         return false;
     }
-    const int64_t first = ggml_cuda_tier_first_host_cell(K);
+    // the selected region: the host tail, or with GGML_CUDA_FA_SPARSE_SINKS every cell from the sinks on (the op must
+    // still reach the host tail, so short contexts stay dense)
+    const int64_t first_host = ggml_cuda_tier_first_host_cell(K);
+    const int64_t first = first_host >= 0 && cfg.sinks >= 0 ? std::min<int64_t>(cfg.sinks, first_host) : first_host;
     const int64_t n_kv  = K->ne[1];
     if (first < 0 || first >= n_kv) {
         return false;
@@ -1179,6 +1189,7 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
         page, n_pages, m_s1);
     fa_sparse_union<<<(n_pages + 255)/256, 256, 0, stream>>>(d_keep.get(), union_buf.get(), n_q, n_pages);
     pages_out->first   = first;
+    pages_out->first_host = first_host;
     pages_out->page    = page;
     pages_out->n_pages = n_pages;
     pages_out->keep    = union_buf.get();
@@ -1467,7 +1478,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             // sparse op: stage only the host pages some query keeps (the others are masked out and keep whatever
             // finite bytes the shared staging buffer holds), so PCIe moves the kept pages only. V needs the same
             // host cells as K; otherwise everything is staged.
-            const bool pages = sparse_pages.keep && ggml_cuda_tier_first_host_cell(V) == sparse_pages.first;
+            const bool pages = sparse_pages.keep && ggml_cuda_tier_first_host_cell(V) == sparse_pages.first_host;
             for (ggml_tensor * t : { K, V }) {
                 void * a = pages
                     ? ggml_cuda_tier_stage_pages(t->data, ggml_nbytes(t), t->nb[1], sparse_pages.first, sparse_pages.page,
