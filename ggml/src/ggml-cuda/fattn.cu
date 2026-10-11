@@ -1450,6 +1450,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (ggml_cuda_fa_sparse_mask(ctx, dst, sparse_buf, &mask_sparse, sparse_union, &sparse_pages)) {
         dst->src[3] = &mask_sparse;
     }
+    struct sparse_flag { bool prev; sparse_flag(bool on) : prev(ggml_cuda_fa_sparse_active) { ggml_cuda_fa_sparse_active = on; }
+        ~sparse_flag() { ggml_cuda_fa_sparse_active = prev; } } sparse_flag_guard(dst->src[3] == &mask_sparse);
 
     // K/V in a tiered buffer whose host tail this op reaches: copy the used host rows into the VRAM staging
     // buffer with the copy engine and point K/V at the all-VRAM alias of the same range for this op. Prefill

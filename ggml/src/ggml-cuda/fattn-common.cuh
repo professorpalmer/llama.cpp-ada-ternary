@@ -699,6 +699,9 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 
 // packed = the mask is GGML_TYPE_I32 (32 cells per word, bit set = attend): mask_ptr then points at words and
 // s31 / s33 are word strides; a tile is fully masked when its FATTN_KQ_STRIDE/32 words are all zero.
+// set by ggml_cuda_flash_attn_ext (fattn.cu) while it launches an attention op with a GGML_CUDA_FA_SPARSE mask
+inline thread_local bool ggml_cuda_fa_sparse_active = false;
+
 // GGML_CUDA_FA_TILE_SKIP=1: per sequence, query tile (ncols1 rows) and FATTN_KQ_STRIDE cells, whether any mask value is
 // finite (f16 mask). The MMA kernel skips the KV tiles of an all -inf block (block-sparse masks: GGML_CUDA_FA_SPARSE).
 template <int ncols1>
@@ -1234,7 +1237,10 @@ void launch_fattn(
     // GGML_CUDA_FA_V_SKIP=1: the vec kernel skips the V rows of 32-cell groups whose weights are all below exp(-20)
     static const bool v_skip = [] { const char * e = getenv("GGML_CUDA_FA_V_SKIP"); return e && atoi(e) != 0; }();
     bool tile_vis = false;
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || (tile_skip && !mask_packed && !chunk))) {
+    // a GGML_CUDA_FA_SPARSE mask (fattn.cu) always takes the tile map: without it the kernel reads every masked tile,
+    // also the unselected host pages over PCIe
+    const bool want_vis = (tile_skip || ggml_cuda_fa_sparse_active) && !mask_packed && !chunk;
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || want_vis)) {
         const size_t  es  = mask_packed ? sizeof(uint32_t) : sizeof(half2);
         const int64_t s31 = mask->nb[1] / es;
         const int64_t s33 = mask->nb[3] / es;
@@ -1246,7 +1252,7 @@ void launch_fattn(
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
         // with GGML_CUDA_FA_TILE_SKIP the tile visibility map follows the KV_max values in the same buffer (flag 4)
-        tile_vis = tile_skip && !mask_packed && !chunk;
+        tile_vis = want_vis;
         KV_max.alloc(ne_KV_max + (tile_vis ? (ne_KV_max*iter_k + 3)/4 : 0));
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         if (tile_vis) {
