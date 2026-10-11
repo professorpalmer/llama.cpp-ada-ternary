@@ -304,6 +304,8 @@ struct kfirst_acc {
     int64_t n_ops = 0;
     double  n_kv = 0.0, host = 0.0, mass = 0.0;
     double  u_mean[KFIRST_NEPS] = {}, u_max[KFIRST_NEPS] = {}, h_mean[KFIRST_NEPS] = {};
+    double  u_head[8][KFIRST_NEPS] = {};   // per KV head (calibration of streaming vs retrieval heads)
+    int     n_kvh = 0;
 };
 
 static void kfirst_warn_once(const char * what) {
@@ -503,6 +505,7 @@ void ggml_cuda_kfirst_probe(ggml_backend_cuda_context & ctx, const ggml_tensor *
         }
     }
     uint32_t valid_max = 0;
+    double u_head_op[8][KFIRST_NEPS] = {};
     for (int g = 0; g < n_kvh; ++g) {
         const uint32_t v = r_uni[g*(KFIRST_NEPS + 1) + KFIRST_NEPS];
         valid_max = std::max(valid_max, v);
@@ -510,6 +513,7 @@ void ggml_cuda_kfirst_probe(ggml_backend_cuda_context & ctx, const ggml_tensor *
             const double f = v ? (double) r_uni[g*(KFIRST_NEPS + 1) + e] / v : 0.0;
             u_mean[e] += f / n_kvh;
             u_max [e]  = std::max(u_max[e], f);
+            u_head_op[std::min(g, 7)][e] = f;
         }
     }
 
@@ -526,7 +530,11 @@ void ggml_cuda_kfirst_probe(ggml_backend_cuda_context & ctx, const ggml_tensor *
         acc.u_mean[e] += u_mean[e];
         acc.u_max [e]  = std::max(acc.u_max[e], u_max[e]);
         acc.h_mean[e] += h_mean[e];
+        for (int g = 0; g < std::min(n_kvh, 8); ++g) {
+            acc.u_head[g][e] += u_head_op[g][e];
+        }
     }
+    acc.n_kvh = std::min(n_kvh, 8);
 
     const int64_t every = ggml_cuda_kfirst_every();
     if (n_ops % every == 0) {
@@ -553,6 +561,16 @@ void ggml_cuda_kfirst_probe(ggml_backend_cuda_context & ctx, const ggml_tensor *
                     s.u_mean[e]/s.n_ops, s.u_max[e], s.h_mean[e]/s.n_ops);
             }
             GGML_LOG_WARN("%s\n", line);
+            // per KV head union fraction (mean over ops), for the streaming/retrieval head calibration
+            char hl[512];
+            int  m = snprintf(hl, sizeof(hl), "kfirst-heads %s", s.name.c_str());
+            for (int e = 0; e < KFIRST_NEPS && m > 0 && m < (int) sizeof(hl); ++e) {
+                m += snprintf(hl + m, sizeof(hl) - m, " | %s", kfirst_eps_name[e]);
+                for (int g = 0; g < s.n_kvh && m > 0 && m < (int) sizeof(hl); ++g) {
+                    m += snprintf(hl + m, sizeof(hl) - m, " %.4f", s.u_head[g][e]/s.n_ops);
+                }
+            }
+            GGML_LOG_WARN("%s\n", hl);
         }
         accs.clear();
     }
