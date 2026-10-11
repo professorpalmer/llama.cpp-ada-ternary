@@ -1292,7 +1292,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int jt,
         const int zt_gqa,
         const int kb0_start,
-        const int kb0_stop) {
+        const int kb0_stop,
+        const uint8_t * tile_vis = nullptr) {   // per FATTN_KQ_STRIDE cells of this query tile: 0 = all masked, skip
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1428,6 +1429,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     if constexpr (ncols2 == 1) {
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop-1; ++kb0) {
+            if constexpr (nstages <= 1) {   // no cross-iteration preload: a fully masked tile can be skipped
+                if (tile_vis && !tile_vis[(kb0*nbatch_fa)/FATTN_KQ_STRIDE]) {
+                    continue;
+                }
+            }
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
@@ -1448,6 +1454,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ++kb0) {
+            if constexpr (nstages <= 1) {   // no cross-iteration preload: a fully masked tile can be skipped
+                if (tile_vis && !tile_vis[(kb0*nbatch_fa)/FATTN_KQ_STRIDE]) {
+                    continue;
+                }
+            }
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
@@ -1947,6 +1958,8 @@ static __global__ void flash_attn_ext_f16(
     // mask_packed & 2: chunk launch (GGML_CUDA_FA_CHUNK, launch_fattn). Every block has one whole tile and takes the
     // needs_fixup path: unnormalized output to dst, (max, rowsum) to dst_meta, for the chunk fold kernel.
     const bool chunk_part = (mask_packed & 2) != 0;
+    // mask_packed & 4: GGML_CUDA_FA_TILE_SKIP map after the KV_max values (launch_fattn), [sequence][jt][ne11/FATTN_KQ_STRIDE]
+    const uint8_t * tile_vis_all = (mask_packed & 4) && KV_max ? (const uint8_t *) (KV_max + (ne01.z + ncols1 - 1)/ncols1*ne03) : nullptr;
 
     const int stride_V = V_is_K_view ? stride_K : (type_KV == GGML_TYPE_F16 ? nb21 / sizeof(half2) : nb21);
 
@@ -1994,12 +2007,14 @@ static __global__ void flash_attn_ext_f16(
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop,
+                 tile_vis_all ? tile_vis_all + ((int64_t) sequence*iter_j + jt)*(ne11/FATTN_KQ_STRIDE) : nullptr);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile, or a chunk launch.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop,
+                 tile_vis_all ? tile_vis_all + ((int64_t) sequence*iter_j + jt)*(ne11/FATTN_KQ_STRIDE) : nullptr);
         }
 
         kbc += iter_k;
@@ -2040,7 +2055,8 @@ static __global__ void flash_attn_ext_f16(
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV>
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop,
+                 tile_vis_all ? tile_vis_all + ((int64_t) sequence*iter_j + jt)*(ne11/FATTN_KQ_STRIDE) : nullptr);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
