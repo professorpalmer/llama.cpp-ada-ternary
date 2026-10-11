@@ -21,6 +21,16 @@ static __global__ void gdn_precompute_exp(const float * g, float * g_exp, int64_
     }
 }
 
+// fused state gather -> contiguous s0 [S_v, S_v, H, n_seqs] for the chunked MMA kernel (per sequence one cache row)
+static __global__ void gdn_gather_state(const float * base, const int32_t * ids, const int64_t row_stride,
+        float * out, const int64_t n_per_seq, const int64_t n_seqs) {
+    const int64_t n = n_per_seq * n_seqs;
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) blockDim.x*gridDim.x) {
+        const int64_t seq = i / n_per_seq;
+        out[i] = base[(int64_t) ids[seq]*row_stride + (i - seq*n_per_seq)];
+    }
+}
+
 // raw gates -> activated gates for the chunked MMA kernel: beta = sigmoid(beta), g = raw_a[h] * softplus(g + dt_bias[h]),
 // the same formulas as the RAW path of gated_delta_net_cuda. g and beta are contiguous [1, H, n_tokens, n_seqs].
 static __global__ void gdn_activate_raw_gates(const float * g, const float * beta, const float * raw_dt_bias,
@@ -427,13 +437,30 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // over the last K tokens from it, writing the K snapshot slots exactly as before.
     static const bool mma_off = getenv("GGML_CUDA_GDN_MMA_DISABLE") != nullptr;
     const int64_t n_mma = K == 1 ? n_tokens : (n_seqs == 1 ? n_tokens - K : 0);
-    if (!mma_off && !kda && s_ids == nullptr && n_mma >= 64) {
+    if (!mma_off && n_tokens >= 64 && (kda || n_mma < 64)) {
+        static bool logged_skip = false;
+        if (!logged_skip) {
+            GGML_LOG_WARN("%s: chunked GDN prefill (MMA) skipped: %lld tokens, K %d, kda %d, seqs %lld\n",
+                __func__, (long long) n_tokens, K, (int) kda, (long long) n_seqs);
+            logged_skip = true;
+        }
+    }
+    if (!mma_off && !kda && n_mma >= 64) {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
         args.eligible = src_g->ne[0] == 1 && S_v == 128 && neq0 == 128;   // K is handled here
         args.n_tokens = n_mma;
+        ggml_cuda_pool_alloc<float> s_in(ctx.pool());
         ggml_cuda_pool_alloc<float> g_act(ctx.pool());
         ggml_cuda_pool_alloc<float> b_act(ctx.pool());
         ggml_cuda_pool_alloc<float> s_mid(ctx.pool());
+        if (s_ids != nullptr) {
+            // fused gather: copy each sequence's live state out of its cache row first (S_v*S_v*H floats per sequence)
+            const int64_t n_per_seq = S_v * S_v * H;
+            s_in.alloc(n_per_seq * n_seqs);
+            gdn_gather_state<<<(unsigned) std::min<int64_t>((n_per_seq*n_seqs + 255)/256, 4096), 256, 0, stream>>>(
+                s_d, s_ids, s_row_stride, s_in.ptr, n_per_seq, n_seqs);
+            args.state = s_in.ptr;
+        }
         if (raw) {
             const int64_t n_gb = ggml_nelements(src_g);
             GGML_ASSERT(ggml_nelements(src_beta) == n_gb);
@@ -450,7 +477,15 @@ static void ggml_cuda_op_gated_delta_net_impl(
         } else {
             args.state_out = state_d;
         }
-        if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
+        const bool launched = ggml_cuda_gdn_mma_launch(ctx.device, args, stream);
+        static bool logged = false;
+        if (!logged) {
+            GGML_LOG_WARN("%s: chunked GDN prefill (MMA) %s: %lld tokens (%lld by MMA), K %d, H %lld, H_k %lld, raw %d, gather %d, seqs %lld\n",
+                __func__, launched ? "engaged" : "not taken (shape or device)", (long long) n_tokens, (long long) n_mma, K,
+                (long long) H, (long long) neqk1, (int) raw, (int) (s_ids != nullptr), (long long) n_seqs);
+            logged = true;
+        }
+        if (launched) {
             if (K > 1) {
                 // the last K tokens from the MMA state, with the snapshot slots (raw gates still raw here)
                 const int64_t t0 = n_mma;

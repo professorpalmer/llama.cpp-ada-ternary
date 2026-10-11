@@ -10390,6 +10390,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   67, 1, 3, false, false, /*K=*/4, false, -1, /*raw=*/true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  200, 2, 3, false, false, /*K=*/3, false, -1, /*raw=*/true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3, false, false, /*K=*/3, false, -1, /*raw=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 3, false, false, /*K=*/3, /*rows=*/true, -1, /*raw=*/true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 3, false, false, /*K=*/1, /*rows=*/true, -1, /*raw=*/true));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
