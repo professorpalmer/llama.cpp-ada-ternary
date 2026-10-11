@@ -696,7 +696,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         float        * const __restrict__ KQ_rowsum,
         const int jt,
         const int kb0,
-        const int k_VKQ_sup) {
+        const int k_VKQ_sup,
+        const int kb0_next = -1) {   // the tile the multi-stage pipeline preloads next (-1: kb0 + 1)
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
@@ -1091,10 +1092,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (!last_iter) {
             if (ncols2 > 1 || mask_h) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
-                    (flash_attn_ext_f16_mask_at(mask_h, stride_mask, k_VKQ_0 + nbatch_fa), tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
+                    (flash_attn_ext_f16_mask_at(mask_h, stride_mask, kb0_next >= 0 ? kb0_next*nbatch_fa : k_VKQ_0 + nbatch_fa), tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
             }
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+                (K_h2 + int64_t(kb0_next >= 0 ? kb0_next*nbatch_fa : k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
         }
     }
 
@@ -1409,7 +1410,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     __syncthreads();
 
-    int kb0 = kb0_start;
+    // GGML_CUDA_FA_TILE_SKIP: the next KV tile with a visible cell for this query tile (the last tile always runs)
+    auto next_vis = [&](int k) {
+        if (tile_vis) {
+            while (k < kb0_stop - 1 && !tile_vis[(k*nbatch_fa)/FATTN_KQ_STRIDE]) {
+                ++k;
+            }
+        }
+        return k;
+    };
+    int kb0 = next_vis(kb0_start);
 
     // Preload mask and K data for first iteration when using cp_async with multiple stages:
     if constexpr (nstages > 1) {
@@ -1428,12 +1438,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
     if constexpr (ncols2 == 1) {
         constexpr bool oob_check = true;
-        for (; kb0 < kb0_stop-1; ++kb0) {
-            if constexpr (nstages <= 1) {   // no cross-iteration preload: a fully masked tile can be skipped
-                if (tile_vis && !tile_vis[(kb0*nbatch_fa)/FATTN_KQ_STRIDE]) {
-                    continue;
-                }
-            }
+        for (; kb0 < kb0_stop-1; ) {
+            const int kb0_next = next_vis(kb0 + 1);   // fully masked tiles are skipped, also by the preload
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
@@ -1441,7 +1447,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_KV>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, kb0_next);
+            kb0 = kb0_next;
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
@@ -1453,12 +1460,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     } else {
         constexpr bool oob_check = false;
-        for (; kb0 < kb0_stop-1; ++kb0) {
-            if constexpr (nstages <= 1) {   // no cross-iteration preload: a fully masked tile can be skipped
-                if (tile_vis && !tile_vis[(kb0*nbatch_fa)/FATTN_KQ_STRIDE]) {
-                    continue;
-                }
-            }
+        for (; kb0 < kb0_stop-1; ) {
+            const int kb0_next = next_vis(kb0 + 1);   // fully masked tiles are skipped, also by the preload
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
@@ -1466,7 +1469,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_KV>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, kb0_next);
+            kb0 = kb0_next;
         }
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
