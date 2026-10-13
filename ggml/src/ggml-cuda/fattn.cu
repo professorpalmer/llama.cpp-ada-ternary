@@ -639,6 +639,8 @@ struct fa_sparse_cfg {
     int64_t budget = 0, page = 64, recent = 1024;
     int     maxq = 64;   // GGML_CUDA_FA_SPARSE_MAXQ: fast mode takes ops of up to this many queries (decode, draft verify)
     int64_t sinks = -1;  // GGML_CUDA_FA_SPARSE_SINKS=N: select pages from cell N on, the VRAM part too (-1: host tail only)
+    int64_t min_host = 0;   // GGML_CUDA_FA_SPARSE_MIN_HOST=N: dense while the host tail has fewer than N cells (sparse costs
+                            // ~16 % on a short tail on 8 GB: 64k, ~18k host cells)
     bool    fast = false;   // GGML_CUDA_FA_SPARSE_FAST=1: decode-sized ops only (<= 8 queries), page bounds cached
     bool    check   = false;   // GGML_CUDA_FA_SPARSE_CHECK=1 (debug): fast mode also recomputes every page, logs stale ones
     bool    notrack = false;   // GGML_CUDA_FA_SPARSE_NOTRACK=1 (debug): writes do not invalidate cached bounds
@@ -664,6 +666,8 @@ static const fa_sparse_cfg & fa_sparse() {
         r.maxq = mq ? std::max(1, atoi(mq)) : 64;
         const char * sk = getenv("GGML_CUDA_FA_SPARSE_SINKS");
         r.sinks = sk ? std::max(0, atoi(sk)) : -1;
+        const char * mh = getenv("GGML_CUDA_FA_SPARSE_MIN_HOST");
+        r.min_host = mh ? std::max<long long>(0, atoll(mh)) : 0;
         return r;
     }();
     return c;
@@ -1024,7 +1028,7 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     const int64_t first_host = ggml_cuda_tier_first_host_cell(K);
     const int64_t first = first_host >= 0 && cfg.sinks >= 0 ? std::min<int64_t>(cfg.sinks, first_host) : first_host;
     const int64_t n_kv  = K->ne[1];
-    if (first < 0 || first >= n_kv) {
+    if (first < 0 || first >= n_kv || n_kv - first_host < cfg.min_host) {
         return false;
     }
     const int64_t n_host  = n_kv - first;
