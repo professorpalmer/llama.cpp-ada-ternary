@@ -1301,6 +1301,44 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     ggml_cuda_pool_alloc<uint8_t> d_keep(ctx.pool(), (size_t) n_q*n_pages);
     fa_sparse_select<<<n_q, 256, n_pages*sizeof(float), stream>>>(ub.get(), d_last.get(), d_keep.get(), n_pages, page,
         (int) cfg.recent, (int) keep_pages);
+    // debug: GGML_CUDA_FA_SPARSE_TRACE=a,b[,n] logs, for the first n ops (default 4096), the rank of the best page that
+    // holds cells [a, b] (absolute positions) in query row 0's page scores, and whether the selection kept it. Rank 0 is
+    // the top page; kept when rank < keep. "layer" is the order in which the K tensors were first seen. Syncs every op.
+    {
+        static int64_t tr[3] = { -1, -1, 4096 };
+        static const bool tr_on = [] {
+            const char * e = getenv("GGML_CUDA_FA_SPARSE_TRACE");
+            if (!e) { return false; }
+            long long a = -1, b = -1, n = 4096;
+            sscanf(e, "%lld,%lld,%lld", &a, &b, &n);
+            tr[0] = a; tr[1] = b; tr[2] = n;
+            return a >= 0 && b >= a;
+        }();
+        static int64_t tr_ops = 0;
+        static std::map<const void *, int> tr_layer;
+        if (tr_on && tr_ops < tr[2] && tr[1] >= first && tr[0] < n_kv) {
+            ++tr_ops;
+            const int layer = tr_layer.emplace(K->data, (int) tr_layer.size()).first->second;
+            std::vector<float> h_ub(n_pages);
+            CUDA_CHECK(cudaMemcpyAsync(h_ub.data(), ub.get(), n_pages*sizeof(float), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const int pa = (int) (std::max<int64_t>(tr[0], first) - first)/page;
+            const int pb = (int) std::min<int64_t>((std::min<int64_t>(tr[1], n_kv - 1) - first)/page, n_pages - 1);
+            int best_rank = INT_MAX, best_p = -1;
+            for (int pt = pa; pt <= pb; ++pt) {
+                int rank = 0;
+                for (int q = 0; q < n_pages; ++q) {
+                    rank += h_ub[q] > h_ub[pt] || (h_ub[q] == h_ub[pt] && q < pt);
+                }
+                if (rank < best_rank) { best_rank = rank; best_p = pt; }
+            }
+            float top = -INFINITY;
+            for (int q = 0; q < n_pages; ++q) { top = fmaxf(top, h_ub[q]); }
+            GGML_LOG_WARN("%s: TRACE layer %d op %lld: cells %lld..%lld = pages %d..%d of %d; best rank %d (page %d, score %.3f, top %.3f), keep %lld: %s\n",
+                __func__, layer, (long long) tr_ops, (long long) tr[0], (long long) tr[1], pa, pb, n_pages, best_rank, best_p,
+                best_p >= 0 ? h_ub[best_p] : 0.0f, top, (long long) keep_pages, best_rank < keep_pages ? "kept" : "DROPPED");
+        }
+    }
     if (cfg.check) {
         // the earlier host selection, same tie rule: count the pages where the two differ
         std::vector<float>   h_ub((size_t) n_q*n_pages);
