@@ -480,18 +480,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_store_q4_0_block(
 }
 
 // Dequantize one q3_0 block (32 weights) given its scale, the 8 low-bit bytes as 2 words and the 4 high-bit bytes as
-// 1 word (layout in ggml-common.h), store 16 half2. Same arithmetic as dequantize_q3_0 -> half.
+// 1 word (layout in ggml-common.h), store 16 half2. Each pair of weights is built as a half2 directly: the 3-bit codes go
+// into the low mantissa bits of 1024.0 (0x6400), so the half is 1024 + q exactly; minus 1028 gives q - 4 exactly, and
+// one half multiply by d rounds the exact product d*(q - 4) once, the same value as the float path rounded to half
+// (bit-exact with dequantize_q3_0 -> half), with no int/float conversions.
 static __device__ __forceinline__ void flash_attn_ext_f16_store_q3_0_block(
         half2 * const __restrict__ dst, const float d, const uint32_t l0, const uint32_t l1, const uint32_t h) {
     const uint32_t l[2] = {l0, l1};
+    const half2 d2   = __float2half2_rn(d);   // exact: d came from an f16 scale
+    const half2 c1028 = __float2half2_rn(1028.0f);
 #pragma unroll
     for (int j = 0; j < 32; j += 2) {
-        // weights j, j+1: low bits in bytes j%8, j%8+1 at shift 2*(j/8), high bit in bytes j%4, j%4+1 at shift j/4
-        const uint32_t vl = l[(j%8)/4] >> (8*(j%4) + 2*(j/8));
-        const uint32_t vh = h          >> (8*(j%4) +   j/4);
-        const int q0 = int(( vl       & 3) | (( vh       & 1) << 2));
-        const int q1 = int(((vl >> 8) & 3) | (((vh >> 8) & 1) << 2));
-        dst[j/2] = __floats2half2_rn(d*(float(q0) - 4.0f), d*(float(q1) - 4.0f));
+        // weights j, j+1: low bits in bytes j%4, j%4+1 of word l[(j%8)/4] at shift 2*(j/8); high bit in bytes j%4,
+        // j%4+1 of h at shift j/4. The byte permute puts the two bytes into the low byte of each 16-bit lane.
+        const uint32_t sel = (j % 4) == 0 ? 0x4140 : 0x4342;
+        const uint32_t lo  = (__byte_perm(l[(j%8)/4], 0, sel) >> (2*(j/8))) & 0x00030003u;
+        const uint32_t hi  = ((__byte_perm(h,         0, sel) >> (j/4))     & 0x00010001u) << 2;
+        const uint32_t v   = lo | hi | 0x64006400u;
+        dst[j/2] = __hmul2(__hsub2(*(const half2 *) &v, c1028), d2);
     }
 }
 
