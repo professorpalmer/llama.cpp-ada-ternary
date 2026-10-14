@@ -644,6 +644,8 @@ struct fa_sparse_cfg {
     bool    fast = false;   // GGML_CUDA_FA_SPARSE_FAST=1: decode-sized ops only (<= 8 queries), page bounds cached
     bool    check   = false;   // GGML_CUDA_FA_SPARSE_CHECK=1 (debug): fast mode also recomputes every page, logs stale ones
     bool    notrack = false;   // GGML_CUDA_FA_SPARSE_NOTRACK=1 (debug): writes do not invalidate cached bounds
+    float   frac    = 0.0f;    // GGML_CUDA_FA_SPARSE_FRAC=f: keep at least f of the host tail (B is the floor), so the budget
+                               // grows with depth (245k at B 8192 = 3.9 % of the tail lost an exact copy; 5.8 % kept it)
     bool    norm    = false;   // GGML_CUDA_FA_SPARSE_NORM=1: rank pages by each Q head's bound relative to that head's best page
 };
 
@@ -665,6 +667,8 @@ static const fa_sparse_cfg & fa_sparse() {
         r.notrack = n && atoi(n) != 0;
         const char * mq = getenv("GGML_CUDA_FA_SPARSE_MAXQ");
         r.maxq = mq ? std::max(1, atoi(mq)) : 64;
+        const char * fr = getenv("GGML_CUDA_FA_SPARSE_FRAC");
+        r.frac = fr ? std::max(0.0f, std::min(1.0f, (float) atof(fr))) : 0.0f;
         const char * nm = getenv("GGML_CUDA_FA_SPARSE_NORM");
         r.norm = nm && atoi(nm) != 0;
         const char * sk = getenv("GGML_CUDA_FA_SPARSE_SINKS");
@@ -674,6 +678,12 @@ static const fa_sparse_cfg & fa_sparse() {
         return r;
     }();
     return c;
+}
+
+// pages a sparse op keeps from a host tail of n_sel cells: B, or f of the tail when that is more
+static int64_t fa_sparse_keep_pages(const fa_sparse_cfg & cfg, int64_t n_sel) {
+    const int64_t cells = std::max<int64_t>(cfg.budget, (int64_t) ceilf(cfg.frac*(float) n_sel));
+    return std::max<int64_t>(1, cells/cfg.page);
 }
 
 // Fast mode: page-bound tables kept across ops, one per K cache tensor (key: the K data address the attention views start
@@ -740,7 +750,7 @@ bool ggml_cuda_fa_sparse_eligible(const ggml_tensor * fa) {
         return false;
     }
     const int64_t n_pages = (K->ne[1] - first + cfg.page - 1)/cfg.page;
-    return n_pages > std::max<int64_t>(1, cfg.budget/cfg.page) && n_pages <= 12288;
+    return n_pages > fa_sparse_keep_pages(cfg, K->ne[1] - first) && n_pages <= 12288;
 }
 
 // buffer-level writes (ggml-cuda.cu: set_tensor, memset, copies, clear, free): everything from p on
@@ -1169,7 +1179,7 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     const int64_t n_host  = n_kv - first;
     const int     page    = (int) cfg.page;
     const int     n_pages = (int) ((n_host + page - 1)/page);
-    const int64_t keep_pages = std::max<int64_t>(1, cfg.budget/page);
+    const int64_t keep_pages = fa_sparse_keep_pages(cfg, n_host);
     if (n_pages <= keep_pages || n_pages > 12288) {
         return false;   // nothing to drop, or more page scores than fa_sparse_select holds in shared memory (48 KB)
     }
