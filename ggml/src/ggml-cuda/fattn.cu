@@ -644,6 +644,7 @@ struct fa_sparse_cfg {
     bool    fast = false;   // GGML_CUDA_FA_SPARSE_FAST=1: decode-sized ops only (<= 8 queries), page bounds cached
     bool    check   = false;   // GGML_CUDA_FA_SPARSE_CHECK=1 (debug): fast mode also recomputes every page, logs stale ones
     bool    notrack = false;   // GGML_CUDA_FA_SPARSE_NOTRACK=1 (debug): writes do not invalidate cached bounds
+    bool    norm    = false;   // GGML_CUDA_FA_SPARSE_NORM=1: rank pages by each Q head's bound relative to that head's best page
 };
 
 static const fa_sparse_cfg & fa_sparse() {
@@ -664,6 +665,8 @@ static const fa_sparse_cfg & fa_sparse() {
         r.notrack = n && atoi(n) != 0;
         const char * mq = getenv("GGML_CUDA_FA_SPARSE_MAXQ");
         r.maxq = mq ? std::max(1, atoi(mq)) : 64;
+        const char * nm = getenv("GGML_CUDA_FA_SPARSE_NORM");
+        r.norm = nm && atoi(nm) != 0;
         const char * sk = getenv("GGML_CUDA_FA_SPARSE_SINKS");
         r.sinks = sk ? std::max(0, atoi(sk)) : -1;
         const char * mh = getenv("GGML_CUDA_FA_SPARSE_MIN_HOST");
@@ -962,6 +965,81 @@ static __global__ void fa_sparse_scores(const float * __restrict__ Q, const int8
     }
 }
 
+// GGML_CUDA_FA_SPARSE_NORM: the plain score is the max over Q heads of the raw bound, so heads with large q.k
+// values decide the ranking for all heads. Here each Q head's bound is taken relative to its own best page
+// (ubh - max_p ubh, the log-space distance from that head's top page), and a page ranks by its best head.
+// ubh[(j*n_head + hq)*n_pages + p]: the bound of page p for query row j and Q head hq
+static __global__ void fa_sparse_scores_h(const float * __restrict__ Q, const int8_t * __restrict__ mx, const int8_t * __restrict__ mn,
+        const half * __restrict__ sc, float * __restrict__ ubh, const int D, const int n_pages, const int n_head, const int gqa,
+        const int64_t q_s1, const int64_t q_s2, const int stride_pages) {
+    const int p = blockIdx.x, j = blockIdx.y;
+    __shared__ float red[32];
+    for (int hq = 0; hq < n_head; ++hq) {
+        const int h = hq / gqa;
+        const float  * q = Q + hq*q_s2 + (int64_t) j*q_s1;
+        const int8_t * a = mx + ((int64_t) h*stride_pages + p)*D;
+        const int8_t * b = mn + ((int64_t) h*stride_pages + p)*D;
+        const float    f = __half2float(sc[(int64_t) h*stride_pages + p]);
+        float s = 0.0f;
+        for (int d = threadIdx.x; d < D; d += blockDim.x) {
+            s += fmaxf(q[d]*(float) a[d], q[d]*(float) b[d]);
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            s += __shfl_xor_sync(0xffffffff, s, o);
+        }
+        if ((threadIdx.x & 31) == 0) {
+            red[threadIdx.x >> 5] = s;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.0f;
+            for (int w = 0; w < (int) (blockDim.x >> 5); ++w) {
+                t += red[w];
+            }
+            ubh[((int64_t) j*n_head + hq)*n_pages + p] = t*f;
+        }
+        __syncthreads();
+    }
+}
+
+// ub[j][p] = max over Q heads of (ubh - that head's max over pages); one block per query row
+static __global__ void fa_sparse_norm_combine(const float * __restrict__ ubh, float * __restrict__ ub, const int n_pages,
+        const int n_head) {
+    const int j = blockIdx.x;
+    __shared__ float red[32];
+    __shared__ float hmax;
+    for (int p = threadIdx.x; p < n_pages; p += blockDim.x) {
+        ub[(int64_t) j*n_pages + p] = -INFINITY;
+    }
+    for (int hq = 0; hq < n_head; ++hq) {
+        const float * u = ubh + ((int64_t) j*n_head + hq)*n_pages;
+        float m = -INFINITY;
+        for (int p = threadIdx.x; p < n_pages; p += blockDim.x) {
+            m = fmaxf(m, u[p]);
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+        }
+        if ((threadIdx.x & 31) == 0) {
+            red[threadIdx.x >> 5] = m;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = -INFINITY;
+            for (int w = 0; w < (int) (blockDim.x >> 5); ++w) {
+                t = fmaxf(t, red[w]);
+            }
+            hmax = t;
+        }
+        __syncthreads();
+        for (int p = threadIdx.x; p < n_pages; p += blockDim.x) {
+            float & o = ub[(int64_t) j*n_pages + p];
+            o = fmaxf(o, u[p] - hmax);
+        }
+        __syncthreads();
+    }
+}
+
 // last[j]: the last host-tail column (relative to first) that row j of the mask does not mask out, -1 if none
 static __global__ void fa_sparse_last(const half * __restrict__ mask, int * __restrict__ last, const int64_t first,
         const int64_t n_host, const int64_t m_s1) {
@@ -1206,8 +1284,15 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
         }
     }
     ggml_cuda_pool_alloc<float> ub(ctx.pool(), (size_t) n_q*n_pages);
-    fa_sparse_scores<<<dim3(n_pages, n_q), 256, 0, stream>>>((const float *) Q->data, mx, mn, sc, ub.get(), D, n_pages,
-        n_head, gqa, (int64_t) (Q->nb[1]/sizeof(float)), (int64_t) (Q->nb[2]/sizeof(float)), stride_pages);
+    if (cfg.norm) {
+        ggml_cuda_pool_alloc<float> ubh(ctx.pool(), (size_t) n_q*n_head*n_pages);
+        fa_sparse_scores_h<<<dim3(n_pages, n_q), 256, 0, stream>>>((const float *) Q->data, mx, mn, sc, ubh.get(), D, n_pages,
+            n_head, gqa, (int64_t) (Q->nb[1]/sizeof(float)), (int64_t) (Q->nb[2]/sizeof(float)), stride_pages);
+        fa_sparse_norm_combine<<<n_q, 256, 0, stream>>>(ubh.get(), ub.get(), n_pages, n_head);
+    } else {
+        fa_sparse_scores<<<dim3(n_pages, n_q), 256, 0, stream>>>((const float *) Q->data, mx, mn, sc, ub.get(), D, n_pages,
+            n_head, gqa, (int64_t) (Q->nb[1]/sizeof(float)), (int64_t) (Q->nb[2]/sizeof(float)), stride_pages);
+    }
 
     // a copy of the mask, the causal boundary of each row in the host tail, and the pages to keep (all on the device)
     CUDA_CHECK(cudaMemcpyAsync(mask_buf.get(), M->data, (size_t) m_s1*m_rows*sizeof(half), cudaMemcpyDeviceToDevice, stream));
@@ -1276,8 +1361,8 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     pages_out->keep    = union_buf.get();
     static int64_t st_ops = 0;
     if (++st_ops % 1024 == 1) {   // the first op and every 1024th: the path is engaged (printed while the server runs)
-        GGML_LOG_WARN("%s: GGML_CUDA_FA_SPARSE B=%lld P=%lld R=%lld%s, bounds int8: %lld ops; this op %d queries, host tail %lld cells, keeps %lld of %d pages + recent\n",
-            __func__, (long long) cfg.budget, (long long) cfg.page, (long long) cfg.recent, cfg.fast ? " fast" : "",
+        GGML_LOG_WARN("%s: GGML_CUDA_FA_SPARSE B=%lld P=%lld R=%lld%s%s, bounds int8: %lld ops; this op %d queries, host tail %lld cells, keeps %lld of %d pages + recent\n",
+            __func__, (long long) cfg.budget, (long long) cfg.page, (long long) cfg.recent, cfg.fast ? " fast" : "", cfg.norm ? " norm" : "",
             (long long) st_ops, n_q, (long long) n_host, (long long) keep_pages, n_pages);
     }
     *mask_out = *M;
