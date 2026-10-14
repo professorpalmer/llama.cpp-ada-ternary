@@ -644,8 +644,9 @@ struct fa_sparse_cfg {
     bool    fast = false;   // GGML_CUDA_FA_SPARSE_FAST=1: decode-sized ops only (<= 8 queries), page bounds cached
     bool    check   = false;   // GGML_CUDA_FA_SPARSE_CHECK=1 (debug): fast mode also recomputes every page, logs stale ones
     bool    notrack = false;   // GGML_CUDA_FA_SPARSE_NOTRACK=1 (debug): writes do not invalidate cached bounds
-    float   frac    = 0.0f;    // GGML_CUDA_FA_SPARSE_FRAC=f: keep at least f of the host tail (B is the floor), so the budget
-                               // grows with depth (245k at B 8192 = 3.9 % of the tail lost an exact copy; 5.8 % kept it)
+    float   frac    = 0.0625f; // GGML_CUDA_FA_SPARSE_FRAC=f (default 1/16, 0: B only): keep at least f of the host tail (B is
+                               // the floor), so the budget grows with depth (245k at B 8192 = 3.9 % of the tail lost an exact
+                               // copy; 12288 = 5.8 % kept it)
 };
 
 static const fa_sparse_cfg & fa_sparse() {
@@ -667,7 +668,7 @@ static const fa_sparse_cfg & fa_sparse() {
         const char * mq = getenv("GGML_CUDA_FA_SPARSE_MAXQ");
         r.maxq = mq ? std::max(1, atoi(mq)) : 64;
         const char * fr = getenv("GGML_CUDA_FA_SPARSE_FRAC");
-        r.frac = fr ? std::max(0.0f, std::min(1.0f, (float) atof(fr))) : 0.0f;
+        r.frac = fr ? std::max(0.0f, std::min(1.0f, (float) atof(fr))) : 0.0625f;
         const char * sk = getenv("GGML_CUDA_FA_SPARSE_SINKS");
         r.sinks = sk ? std::max(0, atoi(sk)) : -1;
         const char * mh = getenv("GGML_CUDA_FA_SPARSE_MIN_HOST");
