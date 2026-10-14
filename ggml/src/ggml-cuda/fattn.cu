@@ -1606,7 +1606,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             if (V_alias) {
                 V->data = V_alias;
             }
-        } else if (dst->src[0]->ne[1] >= ggml_cuda_tier_stage_min_q()) {
+        } else if (dst->src[3] != &mask_sparse || dst->src[0]->ne[1] >= ggml_cuda_tier_stage_min_q()) {
+            // GGML_CUDA_KV_TIER_STAGE_MIN_Q (in-place reads for small ops) applies to sparse ops only: their masked pages
+            // are skipped, so in place they read the kept pages only. A dense op (below MIN_HOST, or not eligible) that the
+            // prefetch did not cover is staged as without the switch, instead of reading its whole host tail in place.
             // sparse op: stage only the host pages some query keeps (the others are masked out and keep whatever
             // finite bytes the shared staging buffer holds), so PCIe moves the kept pages only. V needs the same
             // host cells as K; otherwise everything is staged.
