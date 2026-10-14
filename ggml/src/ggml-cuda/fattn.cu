@@ -8,6 +8,7 @@
 #include <cmath>
 #include <atomic>
 #include <map>
+#include <array>
 #include <mutex>
 #include <unordered_map>
 
@@ -644,6 +645,9 @@ struct fa_sparse_cfg {
     bool    fast = false;   // GGML_CUDA_FA_SPARSE_FAST=1: decode-sized ops only (<= 8 queries), page bounds cached
     bool    check   = false;   // GGML_CUDA_FA_SPARSE_CHECK=1 (debug): fast mode also recomputes every page, logs stale ones
     bool    notrack = false;   // GGML_CUDA_FA_SPARSE_NOTRACK=1 (debug): writes do not invalidate cached bounds
+    // GGML_CUDA_FA_SPARSE_LAYERS=a-b:m[,c-d:m...]: the budget of ops on model layers a..b (from the K cache name
+    // cache_k_lN) is multiplied by m (D24: the attention layers at both ends spread their attention over more pages)
+    std::vector<std::array<float, 3>> layer_mult;
     float   frac    = 0.0625f; // GGML_CUDA_FA_SPARSE_FRAC=f (default 1/16, 0: B only): keep at least f of the host tail (B is
                                // the floor), so the budget grows with depth (245k at B 8192 = 3.9 % of the tail lost an exact
                                // copy; 12288 = 5.8 % kept it)
@@ -669,6 +673,19 @@ static const fa_sparse_cfg & fa_sparse() {
         r.maxq = mq ? std::max(1, atoi(mq)) : 64;
         const char * fr = getenv("GGML_CUDA_FA_SPARSE_FRAC");
         r.frac = fr ? std::max(0.0f, std::min(1.0f, (float) atof(fr))) : 0.0625f;
+        if (const char * lm = getenv("GGML_CUDA_FA_SPARSE_LAYERS")) {
+            std::string spec(lm);
+            size_t pos = 0;
+            while (pos < spec.size()) {
+                size_t end = spec.find(',', pos);
+                if (end == std::string::npos) { end = spec.size(); }
+                int a = 0, b = 0; float m = 1.0f;
+                if (sscanf(spec.substr(pos, end - pos).c_str(), "%d-%d:%f", &a, &b, &m) == 3 && b >= a && m > 0.0f) {
+                    r.layer_mult.push_back({ (float) a, (float) b, m });
+                }
+                pos = end + 1;
+            }
+        }
         const char * sk = getenv("GGML_CUDA_FA_SPARSE_SINKS");
         r.sinks = sk ? std::max(0, atoi(sk)) : -1;
         const char * mh = getenv("GGML_CUDA_FA_SPARSE_MIN_HOST");
@@ -678,9 +695,24 @@ static const fa_sparse_cfg & fa_sparse() {
     return c;
 }
 
-// pages a sparse op keeps from a host tail of n_sel cells: B, or f of the tail when that is more
-static int64_t fa_sparse_keep_pages(const fa_sparse_cfg & cfg, int64_t n_sel) {
-    const int64_t cells = std::max<int64_t>(cfg.budget, (int64_t) ceilf(cfg.frac*(float) n_sel));
+// model layer of an attention op's K cache (name cache_k_lN), -1 if unknown
+static int fa_sparse_layer(const ggml_tensor * K) {
+    const ggml_tensor * Ks = K->view_src ? K->view_src : K;
+    int l = -1;
+    return sscanf(Ks->name, "cache_k_l%d", &l) == 1 ? l : -1;
+}
+
+// pages a sparse op keeps from a host tail of n_sel cells: B, or f of the tail when that is more, times the layer's
+// multiplier from GGML_CUDA_FA_SPARSE_LAYERS
+static int64_t fa_sparse_keep_pages(const fa_sparse_cfg & cfg, int64_t n_sel, const ggml_tensor * K) {
+    float m = 1.0f;
+    if (!cfg.layer_mult.empty()) {
+        const int l = fa_sparse_layer(K);
+        for (const auto & e : cfg.layer_mult) {
+            if (l >= (int) e[0] && l <= (int) e[1]) { m = e[2]; }
+        }
+    }
+    const int64_t cells = (int64_t) ((float) std::max<int64_t>(cfg.budget, (int64_t) ceilf(cfg.frac*(float) n_sel))*m);
     return std::max<int64_t>(1, cells/cfg.page);
 }
 
@@ -748,7 +780,7 @@ bool ggml_cuda_fa_sparse_eligible(const ggml_tensor * fa) {
         return false;
     }
     const int64_t n_pages = (K->ne[1] - first + cfg.page - 1)/cfg.page;
-    return n_pages > fa_sparse_keep_pages(cfg, K->ne[1] - first) && n_pages <= 12288;
+    return n_pages > fa_sparse_keep_pages(cfg, K->ne[1] - first, K) && n_pages <= 12288;
 }
 
 // buffer-level writes (ggml-cuda.cu: set_tensor, memset, copies, clear, free): everything from p on
@@ -1102,7 +1134,7 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     const int64_t n_host  = n_kv - first;
     const int     page    = (int) cfg.page;
     const int     n_pages = (int) ((n_host + page - 1)/page);
-    const int64_t keep_pages = fa_sparse_keep_pages(cfg, n_host);
+    const int64_t keep_pages = fa_sparse_keep_pages(cfg, n_host, K);
     if (n_pages <= keep_pages || n_pages > 12288) {
         return false;   // nothing to drop, or more page scores than fa_sparse_select holds in shared memory (48 KB)
     }
@@ -1325,9 +1357,9 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     pages_out->keep    = union_buf.get();
     static int64_t st_ops = 0;
     if (++st_ops % 1024 == 1) {   // the first op and every 1024th: the path is engaged (printed while the server runs)
-        GGML_LOG_WARN("%s: GGML_CUDA_FA_SPARSE B=%lld P=%lld R=%lld%s, bounds int8: %lld ops; this op %d queries, host tail %lld cells, keeps %lld of %d pages + recent\n",
+        GGML_LOG_WARN("%s: GGML_CUDA_FA_SPARSE B=%lld P=%lld R=%lld%s, bounds int8: %lld ops; this op layer %d, %d queries, host tail %lld cells, keeps %lld of %d pages + recent\n",
             __func__, (long long) cfg.budget, (long long) cfg.page, (long long) cfg.recent, cfg.fast ? " fast" : "",
-            (long long) st_ops, n_q, (long long) n_host, (long long) keep_pages, n_pages);
+            (long long) st_ops, fa_sparse_layer(K), n_q, (long long) n_host, (long long) keep_pages, n_pages);
     }
     *mask_out = *M;
     mask_out->data      = mask_buf.get();
