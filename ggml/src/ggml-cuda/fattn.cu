@@ -730,7 +730,9 @@ bool ggml_cuda_fa_sparse_eligible(const ggml_tensor * fa) {
     // still reach the host tail, so short contexts stay dense)
     const int64_t first_host = ggml_cuda_tier_first_host_cell(K);
     const int64_t first = first_host >= 0 && cfg.sinks >= 0 ? std::min<int64_t>(cfg.sinks, first_host) : first_host;
-    if (first < 0 || first >= K->ne[1]) {
+    // MIN_HOST as in ggml_cuda_fa_sparse_mask: below it the op is the dense op, with the tier prefetch (an op left out
+    // of the prefetch but not sparse read the whole host tail in place: 7.8 -> 22.8 ms per graph at 64k on 8 GB)
+    if (first < 0 || first >= K->ne[1] || K->ne[1] - first_host < cfg.min_host) {
         return false;
     }
     const int64_t n_pages = (K->ne[1] - first + cfg.page - 1)/cfg.page;
