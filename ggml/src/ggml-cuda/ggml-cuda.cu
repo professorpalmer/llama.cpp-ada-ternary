@@ -71,6 +71,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -1315,6 +1316,81 @@ static size_t ggml_cuda_tier_demote_all() {
     return freed;
 }
 
+// The reverse of ggml_cuda_tier_demote_all: move the demoted chunks back to VRAM at the same address (the self-timing
+// engage rule chose dense for this depth). The page-bound tables must be freed first. Returns false if VRAM was short
+// (the chunks that could not move stay in system RAM, still correct).
+static bool ggml_cuda_tier_promote_all() {
+    std::lock_guard<std::mutex> lock(g_tier_mutex);
+    bool ok = true;
+    for (auto & rec : g_tier_recs) {
+        if (!rec->demoted) {
+            continue;
+        }
+        CUmemAllocationProp pd = {};
+        pd.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        pd.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        pd.location.id   = rec->physical;
+        CUmemAccessDesc ad = {};
+        ad.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        ad.location.id   = rec->physical;
+        ad.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        bool all = true;
+        for (auto & rr : rec->runs) {
+            if (!rr.demot || !rr.host) {
+                continue;
+            }
+            CUmemGenericAllocationHandle hv;
+            if (cuMemCreate(&hv, rr.len, &pd, 0) != CUDA_SUCCESS) {
+                all = false;
+                continue;
+            }
+            CUdeviceptr tmp = 0;
+            CU_CHECK(cuMemAddressReserve(&tmp, rr.len, 0, 0, 0));
+            CU_CHECK(cuMemMap(tmp, rr.len, 0, hv, 0));
+            CU_CHECK(cuMemSetAccess(tmp, rr.len, &ad, 1));
+            CU_CHECK(cuMemcpyDtoD(tmp, rr.ptr, rr.len));
+            CU_CHECK(cuCtxSynchronize());
+            const size_t off = rr.ptr - rec->va;
+            CU_CHECK(cuMemUnmap(rr.ptr, rr.len));
+            CU_CHECK(cuMemMap(rr.ptr, rr.len, 0, hv, 0));
+            CU_CHECK(cuMemSetAccess(rr.ptr, rr.len, &ad, 1));
+            CU_CHECK(cuMemUnmap(tmp, rr.len));
+            CU_CHECK(cuMemAddressFree(tmp, rr.len));
+            if (rec->va2) {
+                // the alias maps VRAM head pages to themselves again
+                CU_CHECK(cuMemUnmap(rec->va2 + off, rr.len));
+                CU_CHECK(cuMemMap(rec->va2 + off, rr.len, 0, hv, 0));
+                CU_CHECK(cuMemSetAccess(rec->va2 + off, rr.len, &ad, 1));
+                for (auto & e : g_tier_entries) {
+                    if (e.va == rec->va) {
+                        for (size_t k = 0; k < e.host_runs.size(); ++k) {
+                            if (e.host_runs[k].first == off) {
+                                e.host_runs.erase(e.host_runs.begin() + k);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            for (auto & sp : g_tier_spans) {
+                if (sp.va == rec->va) {
+                    for (auto & r2 : sp.runs) {
+                        if (r2.off == off) {
+                            r2.host = false;
+                        }
+                    }
+                }
+            }
+            CU_CHECK(cuMemRelease(rr.h));
+            rr.h    = hv;
+            rr.host = false;
+        }
+        rec->demoted = !all;
+        ok = ok && all;
+    }
+    return ok;
+}
+
 // For a tensor range [ptr, ptr + nbytes) inside a tiered buffer with a staging alias: copy its host-backed
 // bytes into the staging buffers (stream-ordered) and return the same range in the alias, whose pages are
 // all VRAM. nullptr when ptr is not in such a buffer or no byte of the range is host-backed.
@@ -1792,6 +1868,213 @@ static void ggml_cuda_tier_prefetch(ggml_backend_cuda_context & ctx, ggml_cuda_t
     ts.inflight = true;
 }
 
+// Self-timing engage rule (GGML_CUDA_FA_SPARSE_AUTO=1, with the late reserve). Per band of 16k context cells, the
+// first time a decode graph reaches it past GGML_CUDA_FA_SPARSE_MIN_HOST host cells (at the dense line), the engine
+// times N graphs dense (dense line) and N graphs sparse (after the late-reserve demotion), keeps the faster mode
+// (sparse only when > 3 % faster) and moves the chunk back to VRAM if dense won. The decisions are kept for the life
+// of the process and in GGML_CUDA_FA_SPARSE_CALIB (one line per band, under GGML_CUDA_FA_SPARSE_CALIB_KEY), so the
+// same depth always runs the same mode: only the request that first reaches a band runs mixed modes.
+static bool g_sparse_allowed = true;
+bool ggml_cuda_fa_sparse_auto_allows() {
+    return g_sparse_allowed;
+}
+void ggml_cuda_fa_sparse_release_tables();
+
+struct ggml_cuda_sparse_auto {
+    bool    on = false;
+    int64_t band_cells = 16384, min_host = 16384, maxq = 64;
+    int     n_trial = 24, n_warm = 3;
+    std::string path, key;
+    std::map<int64_t, int> decision;            // band -> 1 sparse, 2 dense
+    std::map<int64_t, std::pair<double, double>> ms;
+    int64_t dense_line = -1;
+    // trial
+    int64_t trial_band = -1;
+    int     phase = 0;                          // 0 none, 1 dense, 2 sparse
+    int     seen = 0;
+    std::vector<double> t_dense, t_sparse;
+    std::chrono::steady_clock::time_point last;
+    bool    last_valid = false;
+};
+static ggml_cuda_sparse_auto & ggml_cuda_sparse_auto_state() {
+    static ggml_cuda_sparse_auto a = [] {
+        ggml_cuda_sparse_auto r;
+        const char * e = getenv("GGML_CUDA_FA_SPARSE_AUTO");
+        const char * sp = getenv("GGML_CUDA_FA_SPARSE");
+        r.on = e && atoi(e) != 0 && sp && atoll(sp) > 0;
+        if (const char * m = getenv("GGML_CUDA_FA_SPARSE_MIN_HOST")) { r.min_host = std::max<long long>(1, atoll(m)); }
+        if (const char * q = getenv("GGML_CUDA_FA_SPARSE_MAXQ"))     { r.maxq = std::max(1, atoi(q)); }
+        if (const char * n = getenv("GGML_CUDA_FA_SPARSE_AUTO_N"))   { r.n_trial = std::max(4, atoi(n)); }
+        if (const char * c = getenv("GGML_CUDA_FA_SPARSE_CALIB"))     { r.path = c; }
+        if (const char * k = getenv("GGML_CUDA_FA_SPARSE_CALIB_KEY")) { r.key = k; }
+        if (r.on && !r.path.empty()) {
+            FILE * f = fopen(r.path.c_str(), "r");
+            if (f) {
+                char line[512];
+                bool key_ok = false;
+                while (fgets(line, sizeof(line), f)) {
+                    std::string l(line);
+                    while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) { l.pop_back(); }
+                    if (l.rfind("key ", 0) == 0) {
+                        key_ok = l.substr(4) == r.key;
+                    } else if (key_ok && l.rfind("band ", 0) == 0) {
+                        long long b = 0; char mode[16] = {}; double md = 0, msp = 0;
+                        if (sscanf(l.c_str(), "band %lld %15s %lf %lf", &b, mode, &md, &msp) >= 2) {
+                            r.decision[b] = strcmp(mode, "sparse") == 0 ? 1 : 2;
+                            r.ms[b] = { md, msp };
+                        }
+                    }
+                }
+                fclose(f);
+                GGML_LOG_WARN("%s: sparse auto: %zu band decisions from %s\n", __func__, r.decision.size(), r.path.c_str());
+            }
+        }
+        r.last = std::chrono::steady_clock::now();
+        return r;
+    }();
+    return a;
+}
+
+static void ggml_cuda_sparse_auto_save(const ggml_cuda_sparse_auto & a) {
+    if (a.path.empty()) {
+        return;
+    }
+    FILE * f = fopen(a.path.c_str(), "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "key %s\n", a.key.c_str());
+    for (auto & [b, d] : a.decision) {
+        auto it = a.ms.find(b);
+        fprintf(f, "band %lld %s %.3f %.3f\n", (long long) b, d == 1 ? "sparse" : "dense",
+            it != a.ms.end() ? it->second.first : 0.0, it != a.ms.end() ? it->second.second : 0.0);
+    }
+    fclose(f);
+}
+
+static double ggml_cuda_median(std::vector<double> v) {
+    if (v.empty()) {
+        return 0.0;
+    }
+    std::sort(v.begin(), v.end());
+    return v[v.size()/2];
+}
+
+static size_t ggml_cuda_tier_demote_all();
+static void ggml_cuda_sparse_set_mode(bool sparse) {
+    // sparse needs the late reserve in place (the page bounds live in that VRAM); dense moves the chunk back
+    bool demoted = false;
+    {
+        std::lock_guard<std::mutex> lock(g_tier_mutex);
+        for (auto & rec : g_tier_recs) {
+            demoted = demoted || rec->demoted;
+        }
+    }
+    if (sparse && !demoted) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        ggml_cuda_tier_demote_all();
+    } else if (!sparse && demoted) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        ggml_cuda_fa_sparse_release_tables();
+        ggml_cuda_tier_promote_all();
+    }
+    g_sparse_allowed = sparse;
+}
+
+// at graph begin: time decode graphs that reach the host tail, and set the mode for this graph
+static void ggml_cuda_sparse_auto_graph(const ggml_cgraph * cgraph) {
+    ggml_cuda_sparse_auto & a = ggml_cuda_sparse_auto_state();
+    if (!a.on) {
+        return;
+    }
+    int64_t n_kv = -1, fh = -1;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_FLASH_ATTN_EXT && n->src[0] && n->src[1] && n->src[0]->ne[1] <= a.maxq) {
+            const int64_t h = ggml_cuda_tier_first_host_cell(n->src[1]);
+            if (h >= 0) {
+                n_kv = n->src[1]->ne[1];
+                fh   = h;
+                break;
+            }
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (n_kv < 0) {
+        return;   // not a decode graph past the line (prefill, the MTP draft context): the step period runs on
+    }
+    bool demoted = false;
+    {
+        std::lock_guard<std::mutex> lock(g_tier_mutex);
+        for (auto & rec : g_tier_recs) {
+            demoted = demoted || rec->demoted;
+        }
+    }
+    if (a.dense_line < 0 && !demoted) {
+        a.dense_line = fh;
+    }
+    const int64_t dense_line = a.dense_line >= 0 ? a.dense_line : fh;
+    if (n_kv - dense_line < a.min_host) {
+        if (demoted) {
+            ggml_cuda_sparse_set_mode(false);   // shallower than the engage point again (a new, short conversation)
+        }
+        g_sparse_allowed = false;
+        a.last_valid = false;
+        return;
+    }
+    const int64_t band = n_kv / a.band_cells;
+    const double  dt   = std::chrono::duration<double, std::milli>(now - a.last).count();
+    const bool    dt_ok = a.last_valid && dt < 1500.0;
+    a.last = now;
+    a.last_valid = true;
+
+    auto it = a.decision.find(band);
+    if (it != a.decision.end() && a.trial_band != band) {
+        const bool want = it->second == 1;
+        if (want != g_sparse_allowed || want != demoted) {
+            ggml_cuda_sparse_set_mode(want);
+            a.last_valid = false;
+        }
+        return;
+    }
+    // trial for this band: dense first (dense line), then sparse (demoted)
+    if (a.trial_band != band) {
+        a.trial_band = band;
+        a.phase = 1;
+        a.seen = 0;
+        a.t_dense.clear();
+        a.t_sparse.clear();
+        ggml_cuda_sparse_set_mode(false);
+        a.last_valid = false;
+        GGML_LOG_WARN("%s: sparse auto: timing band %lld-%lldk (dense, then sparse)\n", __func__,
+            (long long) (band*a.band_cells/1024), (long long) ((band + 1)*a.band_cells/1024));
+        return;
+    }
+    if (dt_ok && ++a.seen > a.n_warm) {
+        (a.phase == 1 ? a.t_dense : a.t_sparse).push_back(dt);
+    }
+    if (a.phase == 1 && (int) a.t_dense.size() >= a.n_trial) {
+        a.phase = 2;
+        a.seen = 0;
+        ggml_cuda_sparse_set_mode(true);
+        a.last_valid = false;
+    } else if (a.phase == 2 && (int) a.t_sparse.size() >= a.n_trial) {
+        const double md = ggml_cuda_median(a.t_dense), msp = ggml_cuda_median(a.t_sparse);
+        const bool sparse = msp < 0.97*md;
+        a.decision[band] = sparse ? 1 : 2;
+        a.ms[band] = { md, msp };
+        a.trial_band = -1;
+        a.phase = 0;
+        GGML_LOG_WARN("%s: sparse auto: band %lld-%lldk: dense %.1f ms, sparse %.1f ms per graph -> %s\n", __func__,
+            (long long) (band*a.band_cells/1024), (long long) ((band + 1)*a.band_cells/1024), md, msp, sparse ? "sparse" : "dense");
+        ggml_cuda_sparse_auto_save(a);
+        if (!sparse) {
+            ggml_cuda_sparse_set_mode(false);
+        }
+        a.last_valid = false;
+    }
+}
+
 // late reserve: demote the VRAM chunks once an attention op of this graph has a host tail of at least
 // GGML_CUDA_FA_SPARSE_MIN_HOST cells (sparse attention engages there and allocates its page bounds)
 static void ggml_cuda_tier_maybe_demote(const ggml_cgraph * cgraph) {
@@ -1805,7 +2088,7 @@ static void ggml_cuda_tier_maybe_demote(const ggml_cgraph * cgraph) {
         return e ? std::max<long long>(0, atoll(e)) : 0;
     }();
     static bool done = false;
-    if (!want || done) {
+    if (!want || done || ggml_cuda_sparse_auto_state().on) {
         return;
     }
     {
@@ -1842,6 +2125,7 @@ static void ggml_cuda_tier_graph_begin(ggml_backend_cuda_context & ctx, ggml_cud
     ts.rd_next = 0;
     ts.fa.clear();
     ts.next = 0;
+    ggml_cuda_sparse_auto_graph(cgraph);
     ggml_cuda_tier_maybe_demote(cgraph);
     static const bool redirect_on = [] {
         const char * v = getenv("GGML_CUDA_KV_TIER_REDIRECT");
@@ -1974,6 +2258,9 @@ void ggml_cuda_tier_fa_end(ggml_backend_cuda_context & ctx) {
     }
 }
 #else
+bool ggml_cuda_fa_sparse_auto_allows() {
+    return true;
+}
 static bool ggml_cuda_tier_graph_wants_pipeline(const ggml_cgraph * cgraph) {
     GGML_UNUSED(cgraph);
     return false;

@@ -710,6 +710,20 @@ static std::mutex                                fa_sparse_mtx;
 static std::map<const char *, fa_sparse_table>   fa_sparse_tables;
 static std::atomic<uintptr_t>                    fa_sparse_lo{UINTPTR_MAX}, fa_sparse_hi{0};
 
+// free every page-bound table (the engage rule moves the late-reserve chunk back to VRAM; the tables are rebuilt from
+// the K cache when sparse runs again). Call with the device idle.
+void ggml_cuda_fa_sparse_release_tables() {
+    std::lock_guard<std::mutex> lock(fa_sparse_mtx);
+    for (auto & [base, t] : fa_sparse_tables) {
+        if (t.mx) {
+            CUDA_CHECK(cudaFree(t.mx));
+        }
+    }
+    fa_sparse_tables.clear();
+    fa_sparse_lo.store(UINTPTR_MAX);
+    fa_sparse_hi.store(0);
+}
+
 // the bytes [p, p + n) may have changed: in each table that holds some of them, the host cells from the first written
 // one on. rows: the rows a set_rows wrote, relative to p, when its rows (row_bytes) match the table's (else every row of
 // [p, p + n) counts as written). Writes that end before the host tail change nothing. Call with fa_sparse_mtx held.
@@ -745,10 +759,13 @@ static bool fa_sparse_maybe_tracked(const void * p, size_t n) {
 
 // graph setup (ggml-cuda.cu): an attention op the fast path takes stays out of the tier prefetch, which would copy the
 // whole host tail ahead of it (same shape checks as ggml_cuda_fa_sparse_mask)
+bool ggml_cuda_fa_sparse_auto_allows();   // ggml-cuda.cu: the self-timing engage rule (GGML_CUDA_FA_SPARSE_AUTO)
+
 bool ggml_cuda_fa_sparse_eligible(const ggml_tensor * fa) {
     const fa_sparse_cfg & cfg = fa_sparse();
     const ggml_tensor * Q = fa->src[0], * K = fa->src[1], * M = fa->src[3];
-    if (cfg.budget <= 0 || !cfg.fast || !K || !M || M->type != GGML_TYPE_F16 || Q->ne[1] > cfg.maxq) {
+    if (cfg.budget <= 0 || !cfg.fast || !K || !M || M->type != GGML_TYPE_F16 || Q->ne[1] > cfg.maxq ||
+            !ggml_cuda_fa_sparse_auto_allows()) {
         return false;
     }
     // the selected region: the host tail, or with GGML_CUDA_FA_SPARSE_SINKS every cell from the sinks on (the op must
@@ -1085,7 +1102,7 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
         ggml_cuda_pool_alloc<half> & mask_buf, ggml_tensor * mask_out,
         ggml_cuda_pool_alloc<uint8_t> & union_buf, fa_sparse_pages * pages_out) {
     const fa_sparse_cfg & cfg = fa_sparse();
-    if (cfg.budget <= 0) {
+    if (cfg.budget <= 0 || !ggml_cuda_fa_sparse_auto_allows()) {
         return false;
     }
     const ggml_tensor * Q = dst->src[0];
