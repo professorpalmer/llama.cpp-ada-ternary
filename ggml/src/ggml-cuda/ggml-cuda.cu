@@ -1129,6 +1129,21 @@ struct ggml_cuda_tier_span {
 };
 static std::vector<ggml_cuda_tier_span> g_tier_spans; // guarded by g_tier_mutex
 
+// one allocation of a tiered buffer (demot: the top of a VRAM head that GGML_CUDA_KV_TIER_DEMOTE_FRAC set apart)
+struct ggml_cuda_tier_vrun {
+    CUdeviceptr ptr; size_t len; CUmemGenericAllocationHandle h; bool staged; bool host; bool demot;
+};
+// a tiered buffer with demotable chunks (late reserve for the sparse page bounds)
+struct ggml_cuda_tier_rec {
+    CUdeviceptr va = 0, va2 = 0;
+    int physical = 0;
+    std::string key;
+    std::vector<ggml_cuda_tier_vrun> runs;
+    bool demotable = false;
+    bool demoted   = false;
+};
+static std::vector<std::shared_ptr<ggml_cuda_tier_rec>> g_tier_recs; // guarded by g_tier_mutex
+
 static void ggml_cuda_tier_span_register(CUdeviceptr va, size_t total, const std::vector<ggml_cuda_tier_run> & runs) {
     std::lock_guard<std::mutex> lock(g_tier_mutex);
     g_tier_spans.push_back({ va, total, runs });
@@ -1220,6 +1235,84 @@ static bool ggml_cuda_tier_staging_handle(int physical, const std::string & key,
     }
     *out = it->second.first;
     return true;
+}
+
+// Late reserve (GGML_CUDA_KV_TIER_DEMOTE_FRAC): move the demotable chunk at the top of every VRAM head to pinned system
+// RAM, at the same virtual address, so its VRAM is free for the sparse page bounds. Called once, with the device idle,
+// when sparse attention first engages. The chunk joins the staged host tail: its alias pages get a VRAM staging slot of
+// their own, and the entry's host runs (the tier line, staging, write-back, the CUDA-graph check) include it from then on.
+// Kernels keep the same addresses. Returns the bytes of VRAM freed.
+static size_t ggml_cuda_tier_demote_all() {
+    std::lock_guard<std::mutex> lock(g_tier_mutex);
+    size_t freed = 0;
+    for (auto & rec : g_tier_recs) {
+        if (rec->demoted || !rec->demotable) {
+            continue;
+        }
+        CUmemAllocationProp ph = {};
+        ph.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        ph.location.type = CU_MEM_LOCATION_TYPE_HOST;
+        ph.location.id   = 0;
+        CUmemAccessDesc ad = {};
+        ad.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        ad.location.id   = rec->physical;
+        ad.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        int slot = 64;   // staging slots of the chunks: shared by the buffers of one cache, as the tail slots are
+        for (auto & rr : rec->runs) {
+            if (!rr.demot || rr.host) {
+                continue;
+            }
+            CUmemGenericAllocationHandle hh;
+            CU_CHECK(cuMemCreate(&hh, rr.len, &ph, 0));
+            // copy the chunk through a temporary mapping of the host handle, then swap the mapping at the same address
+            CUdeviceptr tmp = 0;
+            CU_CHECK(cuMemAddressReserve(&tmp, rr.len, 0, 0, 0));
+            CU_CHECK(cuMemMap(tmp, rr.len, 0, hh, 0));
+            CU_CHECK(cuMemSetAccess(tmp, rr.len, &ad, 1));
+            CU_CHECK(cuMemcpyDtoD(tmp, rr.ptr, rr.len));
+            CU_CHECK(cuCtxSynchronize());
+            const size_t off = rr.ptr - rec->va;
+            CU_CHECK(cuMemUnmap(rr.ptr, rr.len));
+            CU_CHECK(cuMemMap(rr.ptr, rr.len, 0, hh, 0));
+            CU_CHECK(cuMemSetAccess(rr.ptr, rr.len, &ad, 1));
+            CU_CHECK(cuMemUnmap(tmp, rr.len));
+            CU_CHECK(cuMemAddressFree(tmp, rr.len));
+            if (rec->va2) {
+                CUmemGenericAllocationHandle sh;
+                CU_CHECK(cuMemUnmap(rec->va2 + off, rr.len));
+                if (!ggml_cuda_tier_staging_handle(rec->physical, rec->key, slot++, rr.len, &sh)) {
+                    // no staging slot: map the host pages in place in the alias (read over PCIe, still correct)
+                    sh = hh;
+                }
+                CU_CHECK(cuMemMap(rec->va2 + off, rr.len, 0, sh, 0));
+                CU_CHECK(cuMemSetAccess(rec->va2 + off, rr.len, &ad, 1));
+                if (sh != hh) {
+                    CU_CHECK(cuMemsetD8(rec->va2 + off, 0, rr.len));
+                }
+                for (auto & e : g_tier_entries) {
+                    if (e.va == rec->va && sh != hh) {
+                        e.host_runs.push_back({ off, rr.len });
+                        std::sort(e.host_runs.begin(), e.host_runs.end());
+                    }
+                }
+            }
+            for (auto & sp : g_tier_spans) {
+                if (sp.va == rec->va) {
+                    for (auto & r2 : sp.runs) {
+                        if (r2.off == off) {
+                            r2.host = true;
+                        }
+                    }
+                }
+            }
+            CU_CHECK(cuMemRelease(rr.h));
+            rr.h    = hh;
+            rr.host = true;
+            freed  += rr.len;
+        }
+        rec->demoted = true;
+    }
+    return freed;
 }
 
 // For a tensor range [ptr, ptr + nbytes) inside a tiered buffer with a staging alias: copy its host-backed
@@ -1342,15 +1435,25 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
         const char * e = getenv("GGML_CUDA_KV_TIER_STAGING_FRAC");
         return e ? std::max(0.0, atof(e)) : 2.0;
     }();
+    // GGML_CUDA_KV_TIER_DEMOTE_FRAC=d (late reserve for GGML_CUDA_FA_SPARSE): the top d x part bytes of each VRAM head are
+    // their own allocation, so they can move to system RAM later (ggml_cuda_tier_demote_all) and free that VRAM
+    static const double demote_frac = [] {
+        const char * e = getenv("GGML_CUDA_KV_TIER_DEMOTE_FRAC");
+        return e ? std::max(0.0, atof(e)) : 0.0;
+    }();
     std::vector<bool> in_vram(n_pages);
     std::vector<bool> staged(n_pages);
+    std::vector<bool> demot(n_pages);
     size_t n_vram = 0;
     for (size_t p = 0; p < n_pages; ++p) {
         const size_t off  = p * gran;
         const size_t ip   = std::min<size_t>(off / std::max<size_t>(part, 1), parts - 1);
         const size_t head = (size_t) (bctx->vram_frac * part);
+        // rounded up to the allocation granularity: rounding down in every part could free less than the bounds need
+        const size_t dlen = std::min(head, ((size_t) (demote_frac * part) + gran - 1) / gran * gran);
         in_vram[p] = off - ip*part < head;
         staged[p]  = !in_vram[p] && (double) (off - ip*part - head) < stage_frac * (double) part;
+        demot[p]   = in_vram[p] && dlen > 0 && off - ip*part >= head - dlen;
         n_vram += in_vram[p];
     }
 
@@ -1361,8 +1464,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
         return nullptr;
     }
 
-    struct run { CUdeviceptr ptr; size_t len; CUmemGenericAllocationHandle h; bool staged; bool host; };
-    std::vector<run> runs;
+    std::vector<ggml_cuda_tier_vrun> runs;
     auto undo = [runs_p = &runs, va, total]() {
         for (auto & rr : *runs_p) {
             cuMemUnmap(rr.ptr, rr.len);
@@ -1373,7 +1475,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
 
     for (size_t p = 0; p < n_pages; ) {
         size_t q = p;
-        while (q < n_pages && in_vram[q] == in_vram[p] && staged[q] == staged[p]) {
+        while (q < n_pages && in_vram[q] == in_vram[p] && staged[q] == staged[p] && demot[q] == demot[p]) {
             ++q;
         }
         const size_t len = (q - p) * gran;
@@ -1392,7 +1494,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
             undo();
             return nullptr;
         }
-        runs.push_back({ va + p*gran, len, h, (bool) staged[p], !in_vram[p] });
+        runs.push_back({ va + p*gran, len, h, (bool) staged[p], !in_vram[p], (bool) demot[p] });
         p = q;
     }
 
@@ -1465,8 +1567,21 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
         }
     }
 
+    // the runs live on in a shared record: a demotion swaps handles, and the release below must free the current ones
+    auto rec = std::make_shared<ggml_cuda_tier_rec>();
+    rec->va = va; rec->va2 = va2; rec->physical = physical; rec->key = ggml_cuda_tier_staging_key(bctx->name);
+    rec->runs = runs;
+    for (auto & rr : runs) {
+        rec->demotable = rec->demotable || rr.demot;
+    }
+    if (rec->demotable) {
+        std::lock_guard<std::mutex> lock(g_tier_mutex);
+        g_tier_recs.push_back(rec);
+    }
+
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, (void *) va);
-    ctx->release = [runs, va, va2, total, device]() {
+    ctx->release = [rec, va, va2, total, device]() {
+        const std::vector<ggml_cuda_tier_vrun> & runs = rec->runs;
         ggml_cuda_set_device(device);
         cudaDeviceSynchronize();
         ggml_cuda_tier_span_unregister(va);
@@ -1482,6 +1597,13 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
             cuMemRelease(rr.h);
         }
         cuMemAddressFree(va, total);
+        std::lock_guard<std::mutex> lock(g_tier_mutex);
+        for (size_t i = 0; i < g_tier_recs.size(); ++i) {
+            if (g_tier_recs[i].get() == rec.get()) {
+                g_tier_recs.erase(g_tier_recs.begin() + i);
+                break;
+            }
+        }
     };
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
@@ -1536,17 +1658,22 @@ static const ggml_cuda_tier_entry * ggml_cuda_tier_find(const void * ptr) {
     return nullptr;
 }
 
-// first host run of e that intersects [lo, hi) (offsets in the tiered buffer), as [a, b)
+// the host runs of e that intersect [lo, hi) (offsets in the tiered buffer), as one span [a, b) from the first one's
+// start to the last one's end (a demoted chunk and the staged tail after it are two runs; bytes between them, if any,
+// are host pages mapped in place in the alias, so copying them is harmless)
 static bool ggml_cuda_tier_host_part(const ggml_cuda_tier_entry * e, size_t lo, size_t hi, size_t * a, size_t * b) {
+    bool any = false;
     for (auto & hr : e->host_runs) {
         const size_t x = std::max(lo, hr.first), y = std::min(hi, hr.first + hr.second);
         if (x < y) {
-            *a = x;
+            if (!any) {
+                *a = x;
+            }
             *b = y;
-            return true;
+            any = true;
         }
     }
-    return false;
+    return any;
 }
 
 // first cell (row nb[1]) of t that lives in a host run of its tiered buffer, -1 when none (GGML_CUDA_FA_SPARSE)
@@ -1665,11 +1792,57 @@ static void ggml_cuda_tier_prefetch(ggml_backend_cuda_context & ctx, ggml_cuda_t
     ts.inflight = true;
 }
 
+// late reserve: demote the VRAM chunks once an attention op of this graph has a host tail of at least
+// GGML_CUDA_FA_SPARSE_MIN_HOST cells (sparse attention engages there and allocates its page bounds)
+static void ggml_cuda_tier_maybe_demote(const ggml_cgraph * cgraph) {
+    static const bool want = [] {
+        const char * d = getenv("GGML_CUDA_KV_TIER_DEMOTE_FRAC");
+        const char * sp = getenv("GGML_CUDA_FA_SPARSE");
+        return d && atof(d) > 0.0 && sp && atoll(sp) > 0;
+    }();
+    static const int64_t min_host = [] {
+        const char * e = getenv("GGML_CUDA_FA_SPARSE_MIN_HOST");
+        return e ? std::max<long long>(0, atoll(e)) : 0;
+    }();
+    static bool done = false;
+    if (!want || done) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_tier_mutex);
+        bool any = false;
+        for (auto & rec : g_tier_recs) {
+            any = any || (rec->demotable && !rec->demoted);
+        }
+        if (!any) {
+            return;
+        }
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op != GGML_OP_FLASH_ATTN_EXT || !n->src[1]) {
+            continue;
+        }
+        const int64_t fh = ggml_cuda_tier_first_host_cell(n->src[1]);
+        if (fh >= 0 && n->src[1]->ne[1] - fh >= std::max<int64_t>(1, min_host)) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            const int64_t before = fh;
+            const size_t freed = ggml_cuda_tier_demote_all();
+            const int64_t after = ggml_cuda_tier_first_host_cell(n->src[1]);
+            GGML_LOG_WARN("%s: late reserve: %.1f MiB of the VRAM line moved to system RAM for the sparse page bounds "
+                "(line %lld -> %lld cells)\n", __func__, freed/1048576.0, (long long) before, (long long) after);
+            done = true;
+            return;
+        }
+    }
+}
+
 static void ggml_cuda_tier_graph_begin(ggml_backend_cuda_context & ctx, ggml_cuda_tier_state & ts, const ggml_cgraph * cgraph, bool enable) {
     ts.rd.clear();
     ts.rd_next = 0;
     ts.fa.clear();
     ts.next = 0;
+    ggml_cuda_tier_maybe_demote(cgraph);
     static const bool redirect_on = [] {
         const char * v = getenv("GGML_CUDA_KV_TIER_REDIRECT");
         return v == nullptr || atoi(v) != 0;
