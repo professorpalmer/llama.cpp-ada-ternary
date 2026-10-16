@@ -1541,6 +1541,7 @@ struct fa_psparse_cfg {
     int64_t recent = 4096, sinks = 1024, floor = 12288, min_host = 0;
     bool    stat = false;
     bool    force = false;   // GGML_CUDA_FA_PREFILL_SPARSE_FORCE=1 (debug): engage even when nothing can be dropped
+    bool    vis   = true;    // GGML_CUDA_FA_PREFILL_SPARSE_VIS=0: no tile map (every query tile computes the whole union)
 };
 
 static const fa_psparse_cfg & fa_psparse() {
@@ -1557,6 +1558,7 @@ static const fa_psparse_cfg & fa_psparse() {
         r.min_host = std::max<int64_t>(0, (int64_t) num("GGML_CUDA_FA_PREFILL_SPARSE_MIN_HOST", 0));
         r.stat     = num("GGML_CUDA_FA_PREFILL_SPARSE_STAT", 0) != 0;
         r.force    = num("GGML_CUDA_FA_PREFILL_SPARSE_FORCE", 0) != 0;
+        r.vis      = num("GGML_CUDA_FA_PREFILL_SPARSE_VIS", 1) != 0;
         return r;
     }();
     return c;
@@ -2028,7 +2030,11 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
 
         const ggml_cuda_fattn_chunk state = { (float *) dst->data, meta.get(), it == 0, it == todo.size() - 1 };
         ctx.fattn_chunk = &state;
+        // T3: the tile map skips the K/V tiles a query tile's rows did not keep (each tile computes its own pages)
+        const bool vis_prev = ggml_cuda_fa_psparse_active;
+        ggml_cuda_fa_psparse_active = sparse && fa_psparse().vis;
         ggml_cuda_flash_attn_ext_mma_f16(ctx, &dst_c);
+        ggml_cuda_fa_psparse_active = vis_prev;
         ctx.fattn_chunk = nullptr;
     }
 }
