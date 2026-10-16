@@ -1298,7 +1298,7 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     if (cfg.minq > 0) {
         static int64_t t3_ops = 0;
         if (t3_ops++ % 1024 == 0) {
-            GGML_LOG_INFO("%s: T3 emulation: sparse op %lld: %d queries, %lld cells, region from %lld, %d pages, keep %lld, tile %d\n",
+            GGML_LOG_WARN("%s: T3 emulation: sparse op %lld: %d queries, %lld cells, region from %lld, %d pages, keep %lld, tile %d\n",
                 __func__, (long long) t3_ops, n_q, (long long) n_kv, (long long) first, n_pages, (long long) keep_pages, cfg.qtile);
         }
     }
@@ -1855,7 +1855,7 @@ static bool fa_psparse_select(ggml_backend_cuda_context & ctx, const ggml_tensor
         static double  st_sum = 0.0;
         st_sum += (double) sel.pages.size() / n_pages;
         if (st_ops++ % 1024 == 0) {
-            GGML_LOG_INFO("%s: T3 op %lld: %d queries, %lld cells, keep %d pages + sinks + window, union %zu of %d pages "
+            GGML_LOG_WARN("%s: T3 op %lld: %d queries, %lld cells, keep %d pages + sinks + window, union %zu of %d pages "
                 "(this op %.3f, mean %.3f)\n", __func__, (long long) st_ops, n_q, (long long) n_kv, keep_pages,
                 sel.pages.size(), n_pages, (double) sel.pages.size() / n_pages, st_sum / st_ops);
         }
