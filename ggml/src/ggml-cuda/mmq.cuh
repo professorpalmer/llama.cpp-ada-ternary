@@ -1582,10 +1582,17 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     const int    cc    = ggml_cuda_info().devices[id].cc;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
+    // experiment (T2b): GGML_CUDA_MMQ_MAX_J=n caps the column tile; on sm_75 the PTQ1_0 kernels spill registers at J >= 64
+    static const int J_max = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_MAX_J");
+        const int v = e ? atoi(e) : 128;
+        return v >= 8 && v <= 128 ? v - v % 8 : 128;
+    }();
+
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+    for (int J = 8; J <= J_max && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
             continue;
