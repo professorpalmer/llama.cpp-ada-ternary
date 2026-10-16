@@ -30,10 +30,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
-    // experiment (T2e): GGML_CUDA_FA_TURING_NCOLS=64 lets Turing use the 64-column tile (its config table has one) for
-    // large batches; each K/V tile load then serves twice the Q columns
-    static const bool turing_nc64 = [] { const char * e = getenv("GGML_CUDA_FA_TURING_NCOLS"); return e && atoi(e) == 64; }();
-    if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING && !turing_nc64) ||
+    if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, type_KV>(ctx, dst);
         return;
