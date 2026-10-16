@@ -1647,6 +1647,102 @@ static __global__ void fa_psparse_mask(const uint32_t * __restrict__ mask, uint3
     out[(int64_t) j*out_words + w] = v;
 }
 
+// T3 selection per tile of T query rows (the rows share the tile's max scores): one block per tile. The candidates are
+// the pages before the tile's earliest window (pages < rp_min); the top keep_pages of them come from a threshold search
+// on the score bits (32 counting passes, ties: lower page first), not a pairwise rank. Each row keeps the top set, the
+// pages from rp_min up to its own last visible page, and nothing after that page.
+static __device__ __forceinline__ uint32_t fa_psparse_key(const float f) {
+    const uint32_t b = __float_as_uint(f);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+static __device__ __forceinline__ int fa_psparse_block_sum(int v, int * red) {
+    for (int o = 16; o > 0; o >>= 1) {
+        v += __shfl_xor_sync(0xffffffff, v, o);
+    }
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) {
+        red[threadIdx.x >> 5] = v;
+    }
+    __syncthreads();
+    int t = 0;
+    for (int w = 0; w < (int) (blockDim.x >> 5); ++w) {
+        t += red[w];
+    }
+    return t;
+}
+
+static __global__ void fa_psparse_select_tile(const float * __restrict__ ub, const int * __restrict__ last_cell,
+        uint8_t * __restrict__ keep, const int n_q, const int n_pages, const int page, const int recent, const int keep_pages,
+        const int T) {
+    extern __shared__ uint32_t s_key[];               // [n_pages] keys, then [n_pages] bytes: top set
+    uint8_t * s_top = (uint8_t *) (s_key + n_pages);
+    __shared__ int red[32];
+    __shared__ int s_rp;
+    const int j0 = blockIdx.x*T, j1 = min(n_q, j0 + T);
+    if (threadIdx.x == 0) {
+        int rp = INT_MAX;
+        for (int j = j0; j < j1; ++j) {
+            const int last = last_cell[j];
+            if (last >= 0) {
+                rp = min(rp, max(0, last + 1 - recent)/page);
+            }
+        }
+        s_rp = rp == INT_MAX ? 0 : min(rp, n_pages);
+    }
+    __syncthreads();
+    const int rp = s_rp;
+    for (int p = threadIdx.x; p < rp; p += blockDim.x) {
+        s_key[p] = fa_psparse_key(ub[(int64_t) j0*n_pages + p]);
+        s_top[p] = 0;
+    }
+    __syncthreads();
+    if (keep_pages >= rp) {
+        for (int p = threadIdx.x; p < rp; p += blockDim.x) {
+            s_top[p] = 1;
+        }
+    } else {
+        // largest key t with count(key >= t) >= keep_pages
+        uint32_t t = 0;
+        for (int bit = 31; bit >= 0; --bit) {
+            const uint32_t cand = t | (1u << bit);
+            int c = 0;
+            for (int p = threadIdx.x; p < rp; p += blockDim.x) {
+                c += s_key[p] >= cand;
+            }
+            if (fa_psparse_block_sum(c, red) >= keep_pages) {
+                t = cand;
+            }
+        }
+        int c_gt = 0;
+        for (int p = threadIdx.x; p < rp; p += blockDim.x) {
+            const bool gt = s_key[p] > t;
+            s_top[p] = gt;
+            c_gt += gt;
+        }
+        const int n_gt = fa_psparse_block_sum(c_gt, red);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int need = keep_pages - n_gt;
+            for (int p = 0; p < rp && need > 0; ++p) {
+                if (s_key[p] == t) {
+                    s_top[p] = 1;
+                    --need;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (int j = j0; j < j1; ++j) {
+        const int last = last_cell[j];
+        const int last_page = last < 0 ? -1 : last/page;
+        uint8_t * k = keep + (int64_t) j*n_pages;
+        for (int p = threadIdx.x; p < n_pages; p += blockDim.x) {
+            k[p] = p <= last_page && (p >= rp || s_top[p]);
+        }
+    }
+}
+
 struct fa_psparse_sel {
     ggml_cuda_pool_alloc<uint8_t> keep;    // [n_q][n_pages]
     ggml_cuda_pool_alloc<int>     d_pages; // kept pages, ascending
@@ -1731,8 +1827,13 @@ static bool fa_psparse_select(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_pool_alloc<int> d_last(pool, (size_t) n_q);
         fa_psparse_last_packed<<<n_q, 256, 0, stream>>>((const uint32_t *) M->data, d_last.get(), (int) (n_kv/32),
             (int64_t) (M->nb[1]/sizeof(uint32_t)));
-        fa_sparse_select<<<n_q, 256, n_pages*sizeof(float), stream>>>(ub.get(), d_last.get(), sel.keep.get(), n_pages, page,
-            (int) cfg.recent, keep_pages);
+        if (cfg.qtile > 1 && (size_t) n_pages*5 <= 48*1024) {
+            fa_psparse_select_tile<<<(n_q + cfg.qtile - 1)/cfg.qtile, 256, (size_t) n_pages*5, stream>>>(ub.get(), d_last.get(),
+                sel.keep.get(), n_q, n_pages, page, (int) cfg.recent, keep_pages, cfg.qtile);
+        } else {
+            fa_sparse_select<<<n_q, 256, n_pages*sizeof(float), stream>>>(ub.get(), d_last.get(), sel.keep.get(), n_pages, page,
+                (int) cfg.recent, keep_pages);
+        }
         if (sink_pages > 0) {
             fa_psparse_sinks<<<g_s, 256, 0, stream>>>(ub.get(), sel.keep.get(), n_q, n_pages, sink_pages, true);
         }
