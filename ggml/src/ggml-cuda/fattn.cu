@@ -657,6 +657,9 @@ struct fa_sparse_cfg {
     bool    fast = false;   // GGML_CUDA_FA_SPARSE_FAST=1: decode-sized ops only (<= 8 queries), page bounds cached
     bool    check   = false;   // GGML_CUDA_FA_SPARSE_CHECK=1 (debug): fast mode also recomputes every page, logs stale ones
     bool    notrack = false;   // GGML_CUDA_FA_SPARSE_NOTRACK=1 (debug): writes do not invalidate cached bounds
+    float   floor_frac = -1.0f;   // GGML_CUDA_FA_SPARSE_FLOOR_FRAC=g with _DELTA: always keep max(B, g x tail) pages ...
+    float   delta      = 0.0f;    // GGML_CUDA_FA_SPARSE_DELTA=t (logits): ... and up to the FRAC cap the pages whose bound
+                                  // is within t of the best page's (0: off, the cap is kept as a fixed count)
     float   frac    = 0.0625f; // GGML_CUDA_FA_SPARSE_FRAC=f (default 1/16, 0: B only): keep at least f of the host tail (B is
                                // the floor), so the budget grows with depth (245k at B 8192 = 3.9 % of the tail lost an exact
                                // copy; 12288 = 5.8 % kept it)
@@ -680,6 +683,10 @@ static const fa_sparse_cfg & fa_sparse() {
         r.notrack = n && atoi(n) != 0;
         const char * mq = getenv("GGML_CUDA_FA_SPARSE_MAXQ");
         r.maxq = mq ? std::max(1, atoi(mq)) : 64;
+        const char * ff = getenv("GGML_CUDA_FA_SPARSE_FLOOR_FRAC");
+        r.floor_frac = ff ? std::max(0.0f, std::min(1.0f, (float) atof(ff))) : -1.0f;
+        const char * dl = getenv("GGML_CUDA_FA_SPARSE_DELTA");
+        r.delta = dl ? std::max(0.0f, (float) atof(dl)) : 0.0f;
         const char * fr = getenv("GGML_CUDA_FA_SPARSE_FRAC");
         r.frac = fr ? std::max(0.0f, std::min(1.0f, (float) atof(fr))) : 0.0625f;
         const char * sk = getenv("GGML_CUDA_FA_SPARSE_SINKS");
@@ -1033,18 +1040,41 @@ static __global__ void fa_sparse_last(const half * __restrict__ mask, int * __re
 // per query j: keep the pages from the one holding cell last+1-recent up to the one holding its last visible cell, and of
 // the pages before those the keep_pages with the highest bound (ties: lower page first); drop the rest. One block per
 // query, the scores in shared memory, the rank of each candidate by counting the candidates ahead of it.
+// keep_floor < keep_pages with delta_raw > 0 (GGML_CUDA_FA_SPARSE_DELTA): the top keep_floor pages always, and the pages
+// ranked below them up to keep_pages only while their bound is within delta_raw of the row's best bound. A flat score
+// row (no page clearly ahead) keeps up to the cap; a peaked one keeps about the floor.
 static __global__ void fa_sparse_select(const float * __restrict__ ub, const int * __restrict__ last_cell,
-        uint8_t * __restrict__ keep, const int n_pages, const int page, const int recent, const int keep_pages) {
+        uint8_t * __restrict__ keep, const int n_pages, const int page, const int recent, const int keep_pages,
+        const int keep_floor, const float delta_raw) {
     extern __shared__ float s_ub[];
+    __shared__ float red[32];
     const int j    = blockIdx.x;
     const int last = last_cell[j];
     uint8_t * k = keep + (int64_t) j*n_pages;
     const int last_page   = last < 0 ? -1 : last/page;
     const int recent_page = last < 0 ? 0 : max(0, last + 1 - recent)/page;
+    float m = -INFINITY;
     for (int p = threadIdx.x; p < recent_page; p += blockDim.x) {
         s_ub[p] = ub[(int64_t) j*n_pages + p];
+        m = fmaxf(m, s_ub[p]);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    }
+    if ((threadIdx.x & 31) == 0) {
+        red[threadIdx.x >> 5] = m;
     }
     __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = -INFINITY;
+        for (int w = 0; w < (int) (blockDim.x >> 5); ++w) {
+            t = fmaxf(t, red[w]);
+        }
+        red[0] = t;
+    }
+    __syncthreads();
+    const float best = red[0];
+    const bool  adaptive = delta_raw > 0.0f && keep_floor < keep_pages;
     for (int p = threadIdx.x; p < n_pages; p += blockDim.x) {
         uint8_t v = 0;
         if (p <= last_page) {
@@ -1057,7 +1087,7 @@ static __global__ void fa_sparse_select(const float * __restrict__ ub, const int
                     const float y = s_ub[q];
                     rank += (y > x) || (y == x && q < p);
                 }
-                v = rank < keep_pages;
+                v = rank < (adaptive ? keep_floor : keep_pages) || (adaptive && rank < keep_pages && x >= best - delta_raw);
             }
         }
         k[p] = v;
@@ -1255,8 +1285,35 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     ggml_cuda_pool_alloc<int> d_last(ctx.pool(), (size_t) n_q);
     fa_sparse_last<<<n_q, 256, 0, stream>>>((const half *) M->data, d_last.get(), first, n_host, m_s1);
     ggml_cuda_pool_alloc<uint8_t> d_keep(ctx.pool(), (size_t) n_q*n_pages);
+    int64_t keep_floor = keep_pages;
+    float   delta_raw  = 0.0f;
+    if (cfg.delta > 0.0f && cfg.floor_frac >= 0.0f) {
+        const int64_t floor_cells = std::max<int64_t>(cfg.budget, (int64_t) ceilf(cfg.floor_frac*(float) n_host));
+        keep_floor = std::min<int64_t>(keep_pages, std::max<int64_t>(1, floor_cells/page));
+        float scale = 1.0f;
+        memcpy(&scale, dst->op_params, sizeof(float));
+        delta_raw = cfg.delta / std::max(scale, 1e-6f);   // the bounds are raw q.k sums; the logits are scale x q.k
+    }
     fa_sparse_select<<<n_q, 256, n_pages*sizeof(float), stream>>>(ub.get(), d_last.get(), d_keep.get(), n_pages, page,
-        (int) cfg.recent, (int) keep_pages);
+        (int) cfg.recent, (int) keep_pages, (int) keep_floor, delta_raw);
+    // debug: GGML_CUDA_FA_SPARSE_KEPTSTAT=1 logs, every 256 ops, the mean share of host pages query row 0 kept (syncs)
+    {
+        static const bool ks = [] { const char * e = getenv("GGML_CUDA_FA_SPARSE_KEPTSTAT"); return e && atoi(e) != 0; }();
+        static int64_t ks_ops = 0;
+        static double  ks_sum = 0.0;
+        if (ks) {
+            std::vector<uint8_t> h(n_pages);
+            CUDA_CHECK(cudaMemcpyAsync(h.data(), d_keep.get(), n_pages, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            int64_t c = 0;
+            for (int pp = 0; pp < n_pages; ++pp) { c += h[pp]; }
+            ks_sum += (double) c / n_pages;
+            if (++ks_ops % 256 == 0) {
+                GGML_LOG_WARN("%s: KEPTSTAT %lld ops: mean kept %.3f of host pages (cap %.3f, floor %.3f)\n", __func__,
+                    (long long) ks_ops, ks_sum/ks_ops, (double) keep_pages/n_pages, (double) keep_floor/n_pages);
+            }
+        }
+    }
     // debug: GGML_CUDA_FA_SPARSE_TRACE=a,b[,n] logs, for the first n ops (default 4096), the rank of the best page that
     // holds cells [a, b] (absolute positions) in query row 0's page scores, and whether the selection kept it. Rank 0 is
     // the top page; kept when rank < keep. "layer" is the order in which the K tensors were first seen. Syncs every op.
