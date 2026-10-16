@@ -674,6 +674,9 @@ struct fa_sparse_cfg {
     int64_t sinks = -1;  // GGML_CUDA_FA_SPARSE_SINKS=N: select pages from cell N on, the VRAM part too (-1: host tail only)
     int64_t min_host = 0;   // GGML_CUDA_FA_SPARSE_MIN_HOST=N: dense while the host tail has fewer than N cells (sparse costs
                             // ~16 % on a short tail on 8 GB: 64k, ~18k host cells)
+    int     minq  = 0;      // GGML_CUDA_FA_SPARSE_MINQ=n (emulation, T3): only ops with at least n queries are sparse
+    int     qtile = 1;      // GGML_CUDA_FA_SPARSE_QTILE=T (emulation, T3): each query uses the max page score of its tile
+                            // of T queries (the selection a tile kernel would make); the recent window stays per query
     bool    fast = false;   // GGML_CUDA_FA_SPARSE_FAST=1: decode-sized ops only (<= 8 queries), page bounds cached
     bool    check   = false;   // GGML_CUDA_FA_SPARSE_CHECK=1 (debug): fast mode also recomputes every page, logs stale ones
     bool    notrack = false;   // GGML_CUDA_FA_SPARSE_NOTRACK=1 (debug): writes do not invalidate cached bounds
@@ -704,6 +707,10 @@ static const fa_sparse_cfg & fa_sparse() {
         r.frac = fr ? std::max(0.0f, std::min(1.0f, (float) atof(fr))) : 0.0625f;
         const char * sk = getenv("GGML_CUDA_FA_SPARSE_SINKS");
         r.sinks = sk ? std::max(0, atoi(sk)) : -1;
+        const char * mq2 = getenv("GGML_CUDA_FA_SPARSE_MINQ");
+        r.minq = mq2 ? std::max(0, atoi(mq2)) : 0;
+        const char * qt = getenv("GGML_CUDA_FA_SPARSE_QTILE");
+        r.qtile = qt ? std::max(1, atoi(qt)) : 1;
         const char * mh = getenv("GGML_CUDA_FA_SPARSE_MIN_HOST");
         r.min_host = mh ? std::max<long long>(0, atoll(mh)) : 0;
         return r;
@@ -1053,6 +1060,23 @@ static __global__ void fa_sparse_last(const half * __restrict__ mask, int * __re
 // per query j: keep the pages from the one holding cell last+1-recent up to the one holding its last visible cell, and of
 // the pages before those the keep_pages with the highest bound (ties: lower page first); drop the rest. One block per
 // query, the scores in shared memory, the rank of each candidate by counting the candidates ahead of it.
+// T3 emulation: every row of a tile of T query rows gets the tile's max score per page
+static __global__ void fa_sparse_tile_max(float * __restrict__ ub, const int n_q, const int n_pages, const int T) {
+    const int p = blockIdx.x*blockDim.x + threadIdx.x;
+    const int j0 = blockIdx.y*T;
+    if (p >= n_pages) {
+        return;
+    }
+    const int j1 = min(n_q, j0 + T);
+    float m = -INFINITY;
+    for (int j = j0; j < j1; ++j) {
+        m = fmaxf(m, ub[(int64_t) j*n_pages + p]);
+    }
+    for (int j = j0; j < j1; ++j) {
+        ub[(int64_t) j*n_pages + p] = m;
+    }
+}
+
 static __global__ void fa_sparse_select(const float * __restrict__ ub, const int * __restrict__ last_cell,
         uint8_t * __restrict__ keep, const int n_pages, const int page, const int recent, const int keep_pages) {
     extern __shared__ float s_ub[];
@@ -1159,6 +1183,9 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     const int D = (int) K->ne[0], H_kv = (int) K->ne[2], n_head = (int) Q->ne[2], n_q = (int) Q->ne[1];
     if (cfg.fast && n_q > cfg.maxq) {
         return false;   // prefill stays dense in fast mode
+    }
+    if (n_q < cfg.minq) {
+        return false;
     }
     const int gqa = n_head / H_kv;
     cudaStream_t stream = ctx.stream();
@@ -1269,6 +1296,9 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     ggml_cuda_pool_alloc<float> ub(ctx.pool(), (size_t) n_q*n_pages);
     fa_sparse_scores<<<dim3(n_pages, n_q), 256, 0, stream>>>((const float *) Q->data, mx, mn, sc, ub.get(), D, n_pages,
         n_head, gqa, (int64_t) (Q->nb[1]/sizeof(float)), (int64_t) (Q->nb[2]/sizeof(float)), stride_pages);
+    if (cfg.qtile > 1 && n_q > 1) {
+        fa_sparse_tile_max<<<dim3((n_pages + 255)/256, (n_q + cfg.qtile - 1)/cfg.qtile), 256, 0, stream>>>(ub.get(), n_q, n_pages, cfg.qtile);
+    }
 
     // a copy of the mask, the causal boundary of each row in the host tail, and the pages to keep (all on the device)
     CUDA_CHECK(cudaMemcpyAsync(mask_buf.get(), M->data, (size_t) m_s1*m_rows*sizeof(half), cudaMemcpyDeviceToDevice, stream));
