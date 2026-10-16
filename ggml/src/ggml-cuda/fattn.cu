@@ -1299,6 +1299,13 @@ static bool ggml_cuda_fa_sparse_mask(ggml_backend_cuda_context & ctx, const ggml
     if (cfg.qtile > 1 && n_q > 1) {
         fa_sparse_tile_max<<<dim3((n_pages + 255)/256, (n_q + cfg.qtile - 1)/cfg.qtile), 256, 0, stream>>>(ub.get(), n_q, n_pages, cfg.qtile);
     }
+    if (cfg.minq > 0) {
+        static int64_t t3_ops = 0;
+        if (t3_ops++ % 1024 == 0) {
+            GGML_LOG_INFO("%s: T3 emulation: sparse op %lld: %d queries, %lld cells, region from %lld, %d pages, keep %lld, tile %d\n",
+                __func__, (long long) t3_ops, n_q, (long long) n_kv, (long long) first, n_pages, (long long) keep_pages, cfg.qtile);
+        }
+    }
 
     // a copy of the mask, the causal boundary of each row in the host tail, and the pages to keep (all on the device)
     CUDA_CHECK(cudaMemcpyAsync(mask_buf.get(), M->data, (size_t) m_s1*m_rows*sizeof(half), cudaMemcpyDeviceToDevice, stream));
