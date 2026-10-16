@@ -2075,6 +2075,21 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
     if (stat) {
         t_loop = std::chrono::steady_clock::now();
     }
+    // GGML_CUDA_FA_CHUNK_STAT=1 (debug, dense or T3): per chunked op, the time of the attention launches (events) and of
+    // the whole op (one sync per op); logged every 1024 ops
+    static const bool cstat = [] { const char * e = getenv("GGML_CUDA_FA_CHUNK_STAT"); return e && atoi(e) != 0; }();
+    static cudaEvent_t c_ev[2] = {};
+    static double  c_fa_ms = 0.0, c_op_ms = 0.0;
+    static int64_t c_ops = 0;
+    if (cstat && !c_ev[0]) {
+        CUDA_CHECK(cudaEventCreate(&c_ev[0]));
+        CUDA_CHECK(cudaEventCreate(&c_ev[1]));
+    }
+    std::chrono::steady_clock::time_point c_t0;
+    if (cstat) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        c_t0 = std::chrono::steady_clock::now();
+    }
     for (size_t it = 0; it < todo.size(); ++it) {
         const int64_t ic  = todo[it];
         const int64_t kv0 = ic*C;
@@ -2194,13 +2209,32 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
         // T3: the tile map skips the K/V tiles a query tile's rows did not keep (each tile computes its own pages)
         const bool vis_prev = ggml_cuda_fa_psparse_active;
         ggml_cuda_fa_psparse_active = sparse && fa_psparse().vis;
+        if (cstat) {
+            CUDA_CHECK(cudaEventRecord(c_ev[0], stream));
+        }
         ggml_cuda_flash_attn_ext_mma_f16(ctx, &dst_c);
+        if (cstat) {
+            CUDA_CHECK(cudaEventRecord(c_ev[1], stream));
+            CUDA_CHECK(cudaEventSynchronize(c_ev[1]));
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, c_ev[0], c_ev[1]));
+            c_fa_ms += ms;
+        }
         ggml_cuda_fa_psparse_active = vis_prev;
         ctx.fattn_chunk = nullptr;
     }
     if (stat) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         t3_ms[3] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_loop).count();
+    }
+    if (cstat) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        c_op_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c_t0).count();
+        if (c_ops++ % 1024 == 0) {
+            GGML_LOG_WARN("%s: CHUNK_STAT op %lld (%lld cells, %lld queries, %s): per op %.2f ms, attention launches %.2f ms, the rest %.2f ms\n",
+                __func__, (long long) c_ops, (long long) n_kv, (long long) dst->src[0]->ne[1], sparse ? "T3" : "dense",
+                c_op_ms/c_ops, c_fa_ms/c_ops, (c_op_ms - c_fa_ms)/c_ops);
+        }
     }
 }
 
