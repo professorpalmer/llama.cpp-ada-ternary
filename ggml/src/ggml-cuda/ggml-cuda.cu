@@ -632,6 +632,11 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                 if (attempt > 0) {
                     GGML_LOG_WARN("%s: cuda pool[%d] grew by %.1f MiB on attempt %d\n", __func__, device, reserve_size/1048576.0, attempt + 1);
                 }
+                // GGML_CUDA_POOL_LOG=1 (debug): every growth, to size GGML_CUDA_POOL_RESERVE_MIB
+                static const bool plog = [] { const char * e = getenv("GGML_CUDA_POOL_LOG"); return e && atoi(e) != 0; }();
+                if (plog) {
+                    GGML_LOG_WARN("%s: cuda pool[%d] grew by %.1f MiB to %.1f MiB\n", __func__, device, reserve_size/1048576.0, pool_size/1048576.0);
+                }
                 return;
             }
             size_t free_b = 0, total_b = 0;
