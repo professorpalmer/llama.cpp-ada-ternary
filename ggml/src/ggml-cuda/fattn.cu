@@ -94,17 +94,21 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
-    // GGML_CUDA_FA_PREFILL_NCOLS2=2 (experiment, T2): prefill-sized ops (>= 64 queries) with a GQA ratio that 8 does not
-    // divide (6 here: 24 Q heads over 4 KV heads) pack 2 Q heads per column group instead of 8. With 8, two of every
-    // eight Q-head columns are padding and a tile holds only 32/8 tokens on Turing (64/8 on Ampere+), so each K/V tile is
-    // loaded once per 4 (8) tokens; with 2 there is no padding and a tile holds 16 (32) tokens, so 3 KV-head groups of
-    // 16 (32) tokens load each K/V tile 25 % less often. Every query row's arithmetic is the same either way.
+    // Prefill-sized ops (>= 64 queries) with a GQA ratio that 8 does not divide (6 here: 24 Q heads over 4 KV heads) pack
+    // 2 Q heads per column group instead of 8. With 8, two of every eight Q-head columns are padding and a tile holds only
+    // 32/8 tokens on Turing (64/8 on Ampere+), so each K/V tile is loaded once per 4 (8) tokens; with 2 there is no
+    // padding and a tile holds 16 (32) tokens, so 3 KV-head groups of 16 (32) tokens load each K/V tile 25 % less often.
+    // The tile shape changes the KV split, so the sums run in another order (PPL-equal, not byte-identical).
+    // Default: on for Turing (RTX 2060 SUPER, cold 245k: 1,707 -> 1,489 s; PPL +0.02 % at 4k / 16k, KL 0, top-1 99.997 %),
+    // off elsewhere (RTX 4070: +2.5-5.6 % only). GGML_CUDA_FA_PREFILL_NCOLS2=2: on everywhere; =8: off everywhere.
     {
         static const int pre_nc2 = [] {
             const char * e = getenv("GGML_CUDA_FA_PREFILL_NCOLS2");
             return e ? atoi(e) : 0;
         }();
-        if (pre_nc2 == 2 && use_gqa_opt && Q->ne[1] >= 64 && gqa_ratio % 8 != 0 && gqa_ratio % 2 == 0) {
+        const bool turing = GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING;
+        const bool nc2 = pre_nc2 == 2 || (pre_nc2 == 0 && turing);
+        if (nc2 && use_gqa_opt && Q->ne[1] >= 64 && gqa_ratio % 8 != 0 && gqa_ratio % 2 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, type_KV>(ctx, dst);
             return;
         }
