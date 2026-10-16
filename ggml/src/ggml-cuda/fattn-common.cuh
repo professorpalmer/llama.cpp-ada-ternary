@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
@@ -1366,6 +1368,25 @@ void launch_fattn(
             flash_attn_mask_to_tile_vis_packed<ncols1><<<dim3(n_vis, ntiles_x, Q->ne[3]), 32, 0, main_stream>>>(
                 (const uint32_t *) mask->data, (uint8_t *) (KV_max.ptr + ne_KV_max), n_vis, mask->nb[1]/sizeof(uint32_t),
                 mask->nb[3]/sizeof(uint32_t), (int) Q->ne[1]);
+            // GGML_CUDA_FA_VIS_STAT=1 (debug): the visible share of the tile map (syncs), logged every 1024 launches
+            static const bool vis_stat = [] { const char * e = getenv("GGML_CUDA_FA_VIS_STAT"); return e && atoi(e) != 0; }();
+            if (vis_stat) {
+                static int64_t vs_n = 0;
+                static double  vs_sum = 0.0;
+                const size_t nb = (size_t) ne_KV_max*n_vis;
+                std::vector<uint8_t> h(nb);
+                CUDA_CHECK(cudaMemcpyAsync(h.data(), (uint8_t *) (KV_max.ptr + ne_KV_max), nb, cudaMemcpyDeviceToHost, main_stream));
+                CUDA_CHECK(cudaStreamSynchronize(main_stream));
+                int64_t vis = 0;
+                for (size_t i = 0; i < nb; ++i) {
+                    vis += h[i] != 0;
+                }
+                vs_sum += nb ? (double) vis/nb : 0.0;
+                if (vs_n++ % 1024 == 0) {
+                    GGML_LOG_WARN("%s: VIS_STAT launch %lld: ncols1 %d, %d query tiles x %d cell groups, visible %.3f (mean %.3f)\n",
+                        __func__, (long long) vs_n, ncols1, ntiles_x, n_vis, nb ? (double) vis/nb : 0.0, vs_sum/vs_n);
+                }
+            }
         } else if (tile_vis) {
             flash_attn_mask_to_tile_vis<ncols1><<<dim3(n_vis, ntiles_x, Q->ne[3]), FATTN_TILE_VIS, 0, main_stream>>>(
                 (const half *) mask->data, (uint8_t *) (KV_max.ptr + ne_KV_max), n_vis, mask->nb[1]/sizeof(half),
