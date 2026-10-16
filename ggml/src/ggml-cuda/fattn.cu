@@ -1523,6 +1523,243 @@ bool ggml_cuda_flash_attn_ext_chunked(const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst) == BEST_FATTN_KERNEL_MMA_F16;
 }
 
+// T3 (experiment): block-sparse prefill attention on the chunked path. GGML_CUDA_FA_PREFILL_SPARSE=f (0 or unset: off).
+// For a chunked prefill op whose K reaches the host tail of a tiered buffer (packed mask only): every page (P cells) of
+// K gets int8 max / min bounds, every query a Quest score per page, and each tile of T queries the max score of its rows.
+// Each query keeps its sinks (cells < S), the R cells before its own position, and the top pages up to
+// max(B cells, f x (n_kv - S)) of the rest; the union of the kept pages over the op's queries is all that is converted
+// and computed, chunk by chunk, with a compact packed mask that applies each row's own selection (a row never attends a
+// page its tile did not keep). Knobs: GGML_CUDA_FA_PREFILL_SPARSE_PAGE (64), _RECENT (4096), _SINKS (1024),
+// _FLOOR (12288), _QTILE (64), _MIN_HOST (0), _STAT=1 (logs the union share every 1024 ops).
+struct fa_psparse_cfg {
+    float   frac = 0.0f;
+    int     page = 64, qtile = 64;
+    int64_t recent = 4096, sinks = 1024, floor = 12288, min_host = 0;
+    bool    stat = false;
+};
+
+static const fa_psparse_cfg & fa_psparse() {
+    static const fa_psparse_cfg c = [] {
+        fa_psparse_cfg r;
+        auto num = [](const char * name, double def) { const char * e = getenv(name); return e ? atof(e) : def; };
+        r.frac     = (float) std::max(0.0, std::min(1.0, num("GGML_CUDA_FA_PREFILL_SPARSE", 0.0)));
+        r.page     = std::max(32, (int) num("GGML_CUDA_FA_PREFILL_SPARSE_PAGE", 64));
+        r.page    -= r.page % 32;
+        r.qtile    = std::max(1, (int) num("GGML_CUDA_FA_PREFILL_SPARSE_QTILE", 64));
+        r.recent   = std::max<int64_t>(0, (int64_t) num("GGML_CUDA_FA_PREFILL_SPARSE_RECENT", 4096));
+        r.sinks    = std::max<int64_t>(0, (int64_t) num("GGML_CUDA_FA_PREFILL_SPARSE_SINKS", 1024));
+        r.floor    = std::max<int64_t>(0, (int64_t) num("GGML_CUDA_FA_PREFILL_SPARSE_FLOOR", 12288));
+        r.min_host = std::max<int64_t>(0, (int64_t) num("GGML_CUDA_FA_PREFILL_SPARSE_MIN_HOST", 0));
+        r.stat     = num("GGML_CUDA_FA_PREFILL_SPARSE_STAT", 0) != 0;
+        return r;
+    }();
+    return c;
+}
+
+// last attended cell of each mask row (packed: bit i%32 of word i/32 = cell i)
+static __global__ void fa_psparse_last_packed(const uint32_t * __restrict__ mask, int * __restrict__ last, const int n_words,
+        const int64_t m_s1w) {
+    const int j = blockIdx.x;
+    int best = -1;
+    for (int w = threadIdx.x; w < n_words; w += blockDim.x) {
+        const uint32_t v = mask[(int64_t) j*m_s1w + w];
+        if (v) {
+            best = max(best, w*32 + 31 - __clz(v));
+        }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        best = max(best, __shfl_xor_sync(0xffffffff, best, o));
+    }
+    __shared__ int red[32];
+    if ((threadIdx.x & 31) == 0) {
+        red[threadIdx.x >> 5] = best;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < (int) (blockDim.x >> 5); ++w) {
+            best = max(best, red[w]);
+        }
+        last[j] = max(best, red[0]);
+    }
+}
+
+// sinks pages: out of the ranking (score -inf) before the selection, kept by every row after it
+static __global__ void fa_psparse_sinks(float * __restrict__ ub, uint8_t * __restrict__ keep, const int n_q, const int n_pages,
+        const int sink_pages, const bool after) {
+    const int p = blockIdx.x*blockDim.x + threadIdx.x;
+    const int j = blockIdx.y;
+    if (p >= sink_pages || p >= n_pages || j >= n_q) {
+        return;
+    }
+    if (after) {
+        keep[(int64_t) j*n_pages + p] = 1;
+    } else {
+        ub[(int64_t) j*n_pages + p] = -INFINITY;
+    }
+}
+
+// compact rows: cell c of the compact buffer = cell pages[c/page]*page + c%page - kv0 of the source, for every head
+static __global__ void fa_psparse_gather(const char * __restrict__ src, char * __restrict__ dst, const int * __restrict__ pages,
+        const int page, const int64_t kv0, const int n_valid, const int row_bytes, const int64_t s_nb1, const int64_t s_nb2,
+        const int64_t d_nb1, const int64_t d_nb2) {
+    const int c = blockIdx.x, h = blockIdx.y;
+    if (c >= n_valid) {
+        return;
+    }
+    const int64_t cell = (int64_t) pages[c/page]*page + c%page - kv0;
+    const char * s = src + cell*s_nb1 + h*s_nb2;
+    char       * d = dst + c*d_nb1    + h*d_nb2;
+    if ((row_bytes & 3) == 0 && ((uintptr_t) s & 3) == 0 && ((uintptr_t) d & 3) == 0) {
+        for (int i = threadIdx.x; i < row_bytes/4; i += blockDim.x) {
+            ((int *) d)[i] = ((const int *) s)[i];
+        }
+    } else {
+        for (int i = threadIdx.x; i < row_bytes; i += blockDim.x) {
+            d[i] = s[i];
+        }
+    }
+}
+
+// compact packed mask: row j, word w = the source word of the kept page if row j's tile kept it, else 0 (and 0 past the
+// valid pages)
+static __global__ void fa_psparse_mask(const uint32_t * __restrict__ mask, uint32_t * __restrict__ out,
+        const uint8_t * __restrict__ keep, const int * __restrict__ pages, const int n_pages_c, const int n_pages,
+        const int n_q, const int64_t m_s1w, const int out_words, const int wpp) {
+    const int w = blockIdx.x*blockDim.x + threadIdx.x;
+    const int j = blockIdx.y;
+    if (w >= out_words) {
+        return;
+    }
+    uint32_t v = 0;
+    const int pc = w / wpp;
+    if (pc < n_pages_c) {
+        const int gp = pages[pc];
+        if (keep[(int64_t) min(j, n_q - 1)*n_pages + gp]) {
+            v = mask[(int64_t) j*m_s1w + (int64_t) gp*wpp + w % wpp];
+        }
+    }
+    out[(int64_t) j*out_words + w] = v;
+}
+
+struct fa_psparse_sel {
+    ggml_cuda_pool_alloc<uint8_t> keep;    // [n_q][n_pages]
+    ggml_cuda_pool_alloc<int>     d_pages; // kept pages, ascending
+    std::vector<int>              pages;
+    int                           n_pages = 0;
+    fa_psparse_sel(ggml_cuda_pool & pool) : keep(pool), d_pages(pool) {}
+};
+
+// returns false (dense op) when T3 is off or does not apply; C = chunk cells
+static bool fa_psparse_select(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const int64_t C, fa_psparse_sel & sel) {
+    const fa_psparse_cfg & cfg = fa_psparse();
+    if (cfg.frac <= 0.0f) {
+        return false;
+    }
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cap));
+    if (cap != cudaStreamCaptureStatusNone) {
+        return false;   // the selection syncs the stream
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * M = dst->src[3];
+    if (!M || M->type != GGML_TYPE_I32 || C % cfg.page != 0) {
+        return false;
+    }
+    const int64_t n_kv       = K->ne[1];
+    const int64_t first_host = ggml_cuda_tier_first_host_cell(K);
+    if (first_host < 0 || first_host >= n_kv || n_kv - first_host < cfg.min_host || n_kv % cfg.page != 0) {
+        return false;
+    }
+    const int page    = cfg.page;
+    const int n_pages = (int) (n_kv/page);
+    const int64_t keep_cells = std::max<int64_t>(cfg.floor, (int64_t) ceilf(cfg.frac*(float) std::max<int64_t>(0, n_kv - cfg.sinks)));
+    const int keep_pages = (int) std::max<int64_t>(1, keep_cells/page);
+    const int sink_pages = (int) ((cfg.sinks + page - 1)/page);
+    if (n_pages > 12288 || n_pages <= keep_pages + sink_pages + (int) (cfg.recent/page) + 1) {
+        return false;   // more page scores than fa_sparse_select holds in shared memory, or nothing to drop
+    }
+    const int D = (int) K->ne[0], H_kv = (int) K->ne[2], n_head = (int) Q->ne[2], n_q = (int) Q->ne[1];
+    const int gqa = n_head / H_kv;
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool & pool = ctx.pool();
+    sel.n_pages = n_pages;
+    sel.keep.alloc((size_t) n_q*n_pages);   // outlives the temporaries below
+    {
+        // page bounds of all K pages, chunk by chunk (host rows copied into VRAM first)
+        ggml_cuda_pool_alloc<uint8_t> bnd(pool, fa_sparse_bnd_bytes(H_kv, n_pages, D));
+        int8_t * mx = (int8_t *) bnd.get();
+        int8_t * mn = mx + (size_t) H_kv*n_pages*D;
+        half   * sc = (half *) (mx + (size_t) H_kv*n_pages*D*2);
+        const to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+        const size_t ts = ggml_type_size(K->type);
+        {
+            ggml_cuda_pool_alloc<half> Kh(pool, (size_t) D*std::min(C, n_kv)*H_kv);
+            for (int64_t kv0 = 0; kv0 < n_kv; kv0 += C) {
+                const int64_t n = std::min(C, n_kv - kv0);
+                ggml_tensor Kc = *K;
+                Kc.ne[1] = n;
+                Kc.data  = (char *) K->data + kv0*K->nb[1];
+                const char * K_src = (const char *) Kc.data;
+                const size_t K_span = ggml_nbytes(&Kc);
+                ggml_cuda_pool_alloc<char> K_q(pool);
+                if (ggml_cuda_tier_copy_out(nullptr, K_src, K_span, stream)) {
+                    ggml_cuda_tier_copy_out(K_q.alloc(K_span), K_src, K_span, stream);
+                    K_src = K_q.get();
+                }
+                to_fp16(K_src, Kh.get(), D, n, H_kv, 1, K->nb[1]/ts, K->nb[2]/ts, K->nb[3]/ts, stream);
+                fa_sparse_bounds<<<dim3((int) (n/page), H_kv), 256, 2*D*sizeof(float), stream>>>(Kh.get(), mx, mn, sc, D,
+                    (int) n, page, (int) (kv0/page), n_pages);
+            }
+        }
+        ggml_cuda_pool_alloc<float> ub(pool, (size_t) n_q*n_pages);
+        fa_sparse_scores<<<dim3(n_pages, n_q), 256, 0, stream>>>((const float *) Q->data, mx, mn, sc, ub.get(), D, n_pages,
+            n_head, gqa, (int64_t) (Q->nb[1]/sizeof(float)), (int64_t) (Q->nb[2]/sizeof(float)), n_pages);
+        if (cfg.qtile > 1 && n_q > 1) {
+            fa_sparse_tile_max<<<dim3((n_pages + 255)/256, (n_q + cfg.qtile - 1)/cfg.qtile), 256, 0, stream>>>(ub.get(), n_q, n_pages, cfg.qtile);
+        }
+        const dim3 g_s((sink_pages + 255)/256, n_q);
+        if (sink_pages > 0) {
+            fa_psparse_sinks<<<g_s, 256, 0, stream>>>(ub.get(), sel.keep.get(), n_q, n_pages, sink_pages, false);
+        }
+        ggml_cuda_pool_alloc<int> d_last(pool, (size_t) n_q);
+        fa_psparse_last_packed<<<n_q, 256, 0, stream>>>((const uint32_t *) M->data, d_last.get(), (int) (n_kv/32),
+            (int64_t) (M->nb[1]/sizeof(uint32_t)));
+        fa_sparse_select<<<n_q, 256, n_pages*sizeof(float), stream>>>(ub.get(), d_last.get(), sel.keep.get(), n_pages, page,
+            (int) cfg.recent, keep_pages);
+        if (sink_pages > 0) {
+            fa_psparse_sinks<<<g_s, 256, 0, stream>>>(ub.get(), sel.keep.get(), n_q, n_pages, sink_pages, true);
+        }
+        ggml_cuda_pool_alloc<uint8_t> any(pool, (size_t) n_pages);
+        fa_sparse_union<<<(n_pages + 255)/256, 256, 0, stream>>>(sel.keep.get(), any.get(), n_q, n_pages);
+        std::vector<uint8_t> h_any(n_pages);
+        CUDA_CHECK(cudaMemcpyAsync(h_any.data(), any.get(), n_pages, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        sel.pages.clear();
+        for (int p = 0; p < n_pages; ++p) {
+            if (h_any[p]) {
+                sel.pages.push_back(p);
+            }
+        }
+    }
+    if (sel.pages.empty()) {
+        return false;
+    }
+    sel.d_pages.alloc(sel.pages.size());
+    CUDA_CHECK(cudaMemcpyAsync(sel.d_pages.get(), sel.pages.data(), sel.pages.size()*sizeof(int), cudaMemcpyHostToDevice, stream));
+    if (cfg.stat) {
+        static int64_t st_ops = 0;
+        static double  st_sum = 0.0;
+        st_sum += (double) sel.pages.size() / n_pages;
+        if (st_ops++ % 1024 == 0) {
+            GGML_LOG_INFO("%s: T3 op %lld: %d queries, %lld cells, keep %d pages + sinks + window, union %zu of %d pages "
+                "(this op %.3f, mean %.3f)\n", __func__, (long long) st_ops, n_q, (long long) n_kv, keep_pages,
+                sel.pages.size(), n_pages, (double) sel.pages.size() / n_pages, st_sum / st_ops);
+        }
+    }
+    return true;
+}
+
 static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -1550,7 +1787,26 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
     const to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
     const size_t ts = ggml_type_size(K->type);
 
+    // T3: the kept pages (union over the op's queries) and each row's own selection; off: every cell, as before
+    fa_psparse_sel sel(pool);
+    const bool sparse = fa_psparse_select(ctx, dst, C, sel);
+    const int  page   = fa_psparse().page;
+    std::vector<int64_t> todo;   // chunks with at least one kept page (the last chunk always has: the rows' own cells)
     for (int64_t ic = 0; ic < n_chunks; ++ic) {
+        if (!sparse) {
+            todo.push_back(ic);
+            continue;
+        }
+        const int p_lo = (int) (ic*C/page), p_hi = (int) (std::min(n_kv, (ic + 1)*C)/page);
+        const auto lo = std::lower_bound(sel.pages.begin(), sel.pages.end(), p_lo);
+        if (lo != sel.pages.end() && *lo < p_hi) {
+            todo.push_back(ic);
+        }
+    }
+
+    GGML_ASSERT(!todo.empty());
+    for (size_t it = 0; it < todo.size(); ++it) {
+        const int64_t ic  = todo[it];
         const int64_t kv0 = ic*C;
         const int64_t n   = std::min(C, n_kv - kv0);
 
@@ -1578,14 +1834,46 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
             V_src = V_q.get();
         }
 
+        // T3: compact the chunk's kept pages (quantized rows, [D, n_c, n_head_kv]) before the f16 conversion
+        int64_t n_f16 = n;   // cells converted and computed
+        int pc0 = 0, n_pc = 0;
+        ggml_cuda_pool_alloc<char> K_g(pool);
+        ggml_cuda_pool_alloc<char> V_g(pool);
+        int64_t s1K = K->nb[1]/ts, s2K = K->nb[2]/ts, s3K = K->nb[3]/ts;
+        int64_t s1V = V->nb[1]/ts, s2V = V->nb[2]/ts, s3V = V->nb[3]/ts;
+        if (sparse) {
+            const int p_lo = (int) (kv0/page), p_hi = (int) ((kv0 + n)/page);
+            pc0  = (int) (std::lower_bound(sel.pages.begin(), sel.pages.end(), p_lo) - sel.pages.begin());
+            n_pc = (int) (std::lower_bound(sel.pages.begin(), sel.pages.end(), p_hi) - sel.pages.begin()) - pc0;
+            const int n_valid = n_pc*page;
+            n_f16 = GGML_PAD((int64_t) n_valid, (int64_t) FATTN_KQ_STRIDE);
+            const size_t rbK = ggml_row_size(K->type, K->ne[0]), rbV = ggml_row_size(V->type, V->ne[0]);
+            const size_t szK = rbK*n_f16*K->ne[2], szV = rbV*n_f16*V->ne[2];
+            K_g.alloc(szK);
+            V_g.alloc(szV);
+            CUDA_CHECK(cudaMemsetAsync(K_g.get(), 0, szK, stream));
+            CUDA_CHECK(cudaMemsetAsync(V_g.get(), 0, szV, stream));
+            const dim3 g(n_valid, (unsigned) K->ne[2]);
+            fa_psparse_gather<<<g, 32, 0, stream>>>(K_src, K_g.get(), sel.d_pages.get() + pc0, page, kv0, n_valid, (int) rbK,
+                K->nb[1], K->nb[2], (int64_t) rbK, (int64_t) (rbK*n_f16));
+            fa_psparse_gather<<<g, 32, 0, stream>>>(V_src, V_g.get(), sel.d_pages.get() + pc0, page, kv0, n_valid, (int) rbV,
+                V->nb[1], V->nb[2], (int64_t) rbV, (int64_t) (rbV*n_f16));
+            K_src = K_g.get();
+            V_src = V_g.get();
+            s1K = rbK/ts; s2K = s1K*n_f16; s3K = s2K*K->ne[2];
+            s1V = rbV/ts; s2V = s1V*n_f16; s3V = s2V*V->ne[2];
+        }
+
         // f16 copies of the chunk, contiguous [D, n, n_head_kv]
-        ggml_cuda_pool_alloc<half> K_f16(pool, K->ne[0]*n*K->ne[2]);
-        ggml_cuda_pool_alloc<half> V_f16(pool, V->ne[0]*n*V->ne[2]);
-        to_fp16(K_src, K_f16.get(), K->ne[0], n, K->ne[2], 1, K->nb[1]/ts, K->nb[2]/ts, K->nb[3]/ts, stream);
-        to_fp16(V_src, V_f16.get(), V->ne[0], n, V->ne[2], 1, V->nb[1]/ts, V->nb[2]/ts, V->nb[3]/ts, stream);
+        ggml_cuda_pool_alloc<half> K_f16(pool, K->ne[0]*n_f16*K->ne[2]);
+        ggml_cuda_pool_alloc<half> V_f16(pool, V->ne[0]*n_f16*V->ne[2]);
+        to_fp16(K_src, K_f16.get(), K->ne[0], n_f16, K->ne[2], 1, s1K, s2K, s3K, stream);
+        to_fp16(V_src, V_f16.get(), V->ne[0], n_f16, V->ne[2], 1, s1V, s2V, s3V, stream);
 
         ggml_tensor K_h = Kc;
         ggml_tensor V_h = Vc;
+        K_h.ne[1] = n_f16;
+        V_h.ne[1] = n_f16;
         for (ggml_tensor * t : {&K_h, &V_h}) {
             t->type      = GGML_TYPE_F16;
             t->nb[0]     = sizeof(half);
@@ -1600,7 +1888,24 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
 
         // mask columns of the chunk (packed: 32 cells per word; kv0 is a multiple of 256)
         ggml_tensor mask_c;
-        if (mask) {
+        ggml_cuda_pool_alloc<uint32_t> mask_g(pool);
+        if (sparse) {
+            // T3: compact packed mask, each row's own kept pages only
+            const int wpp       = page/32;
+            const int out_words = (int) (n_f16/32);
+            const int64_t rows  = mask->ne[1];
+            mask_g.alloc((size_t) out_words*rows);
+            fa_psparse_mask<<<dim3((out_words + 255)/256, (unsigned) rows), 256, 0, stream>>>((const uint32_t *) mask->data,
+                mask_g.get(), sel.keep.get(), sel.d_pages.get() + pc0, n_pc, sel.n_pages, (int) dst->src[0]->ne[1],
+                (int64_t) (mask->nb[1]/sizeof(uint32_t)), out_words, wpp);
+            mask_c = *mask;
+            mask_c.ne[0]    = out_words;
+            mask_c.nb[1]    = (size_t) out_words*sizeof(uint32_t);
+            mask_c.nb[2]    = mask_c.nb[1]*rows;
+            mask_c.nb[3]    = mask_c.nb[2];
+            mask_c.data     = mask_g.get();
+            mask_c.view_src = nullptr;
+        } else if (mask) {
             const bool packed = mask->type == GGML_TYPE_I32;
             mask_c = *mask;
             mask_c.ne[0]    = packed ? n/32 : n;
@@ -1614,7 +1919,7 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
         dst_c.src[2] = &V_h;
         dst_c.src[3] = mask ? &mask_c : nullptr;
 
-        const ggml_cuda_fattn_chunk state = { (float *) dst->data, meta.get(), ic == 0, ic == n_chunks - 1 };
+        const ggml_cuda_fattn_chunk state = { (float *) dst->data, meta.get(), it == 0, it == todo.size() - 1 };
         ctx.fattn_chunk = &state;
         ggml_cuda_flash_attn_ext_mma_f16(ctx, &dst_c);
         ctx.fattn_chunk = nullptr;
