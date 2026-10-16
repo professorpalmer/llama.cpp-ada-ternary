@@ -783,6 +783,30 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 
 // set by ggml_cuda_flash_attn_ext (fattn.cu) while it launches an attention op with a GGML_CUDA_FA_SPARSE mask
 inline thread_local bool ggml_cuda_fa_sparse_active = false;
+// set by the T3 chunk loop (fattn.cu, GGML_CUDA_FA_PREFILL_SPARSE) around a launch whose packed mask holds each row's own
+// page selection: the launch then takes the tile map too (packed mask, chunk launch)
+inline thread_local bool ggml_cuda_fa_psparse_active = false;
+
+// the tile map from a packed mask (bit i%32 of word i/32 = cell i): one thread per query row of the tile
+template <int ncols1>
+__launch_bounds__(32)
+static __global__ void flash_attn_mask_to_tile_vis_packed(
+        const uint32_t * __restrict__ mask, uint8_t * __restrict__ vis, const int n_vis, const int64_t s31, const int64_t s33,
+        const int n_rows) {
+    const int s = blockIdx.x, jt = blockIdx.y, sequence = blockIdx.z;
+    constexpr int wpv = FATTN_TILE_VIS/32;
+    bool any = false;
+    for (int j = threadIdx.x; j < ncols1 && jt*ncols1 + j < n_rows; j += 32) {
+        const uint32_t * m = mask + sequence*s33 + (int64_t) (jt*ncols1 + j)*s31 + (int64_t) s*wpv;
+        for (int w = 0; w < wpv; ++w) {
+            any = any || m[w] != 0;
+        }
+    }
+    any = __any_sync(0xffffffff, any);
+    if (threadIdx.x == 0) {
+        vis[((int64_t) sequence*gridDim.y + jt)*n_vis + s] = any;
+    }
+}
 
 // GGML_CUDA_FA_TILE_SKIP=1: per sequence, query tile (ncols1 rows) and FATTN_TILE_VIS cells, whether any mask value is
 // finite (f16 mask). The MMA kernel skips the KV tiles of an all -inf block (block-sparse masks: GGML_CUDA_FA_SPARSE).
@@ -1321,7 +1345,7 @@ void launch_fattn(
     bool tile_vis = false;
     // a GGML_CUDA_FA_SPARSE mask (fattn.cu) always takes the tile map: without it the kernel reads every masked tile,
     // also the unselected host pages over PCIe
-    const bool want_vis = (tile_skip || ggml_cuda_fa_sparse_active) && !mask_packed && !chunk;
+    const bool want_vis = ((tile_skip || ggml_cuda_fa_sparse_active) && !mask_packed && !chunk) || ggml_cuda_fa_psparse_active;
     if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || want_vis)) {
         const size_t  es  = mask_packed ? sizeof(uint32_t) : sizeof(half2);
         const int64_t s31 = mask->nb[1] / es;
@@ -1338,7 +1362,11 @@ void launch_fattn(
         const int n_vis = K->ne[1] / FATTN_TILE_VIS;
         KV_max.alloc(ne_KV_max + (tile_vis ? (ne_KV_max*n_vis + 3)/4 : 0));
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
-        if (tile_vis) {
+        if (tile_vis && mask_packed) {
+            flash_attn_mask_to_tile_vis_packed<ncols1><<<dim3(n_vis, ntiles_x, Q->ne[3]), 32, 0, main_stream>>>(
+                (const uint32_t *) mask->data, (uint8_t *) (KV_max.ptr + ne_KV_max), n_vis, mask->nb[1]/sizeof(uint32_t),
+                mask->nb[3]/sizeof(uint32_t), (int) Q->ne[1]);
+        } else if (tile_vis) {
             flash_attn_mask_to_tile_vis<ncols1><<<dim3(n_vis, ntiles_x, Q->ne[3]), FATTN_TILE_VIS, 0, main_stream>>>(
                 (const half *) mask->data, (uint8_t *) (KV_max.ptr + ne_KV_max), n_vis, mask->nb[1]/sizeof(half),
                 mask->nb[3]/sizeof(half), (int) Q->ne[1]);
