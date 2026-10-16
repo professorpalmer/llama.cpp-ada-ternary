@@ -1536,6 +1536,7 @@ struct fa_psparse_cfg {
     int     page = 64, qtile = 64;
     int64_t recent = 4096, sinks = 1024, floor = 12288, min_host = 0;
     bool    stat = false;
+    bool    force = false;   // GGML_CUDA_FA_PREFILL_SPARSE_FORCE=1 (debug): engage even when nothing can be dropped
 };
 
 static const fa_psparse_cfg & fa_psparse() {
@@ -1551,6 +1552,7 @@ static const fa_psparse_cfg & fa_psparse() {
         r.floor    = std::max<int64_t>(0, (int64_t) num("GGML_CUDA_FA_PREFILL_SPARSE_FLOOR", 12288));
         r.min_host = std::max<int64_t>(0, (int64_t) num("GGML_CUDA_FA_PREFILL_SPARSE_MIN_HOST", 0));
         r.stat     = num("GGML_CUDA_FA_PREFILL_SPARSE_STAT", 0) != 0;
+        r.force    = num("GGML_CUDA_FA_PREFILL_SPARSE_FORCE", 0) != 0;
         return r;
     }();
     return c;
@@ -1676,7 +1678,7 @@ static bool fa_psparse_select(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int64_t keep_cells = std::max<int64_t>(cfg.floor, (int64_t) ceilf(cfg.frac*(float) std::max<int64_t>(0, n_kv - cfg.sinks)));
     const int keep_pages = (int) std::max<int64_t>(1, keep_cells/page);
     const int sink_pages = (int) ((cfg.sinks + page - 1)/page);
-    if (n_pages > 12288 || n_pages <= keep_pages + sink_pages + (int) (cfg.recent/page) + 1) {
+    if (n_pages > 12288 || (!cfg.force && n_pages <= keep_pages + sink_pages + (int) (cfg.recent/page) + 1)) {
         return false;   // more page scores than fa_sparse_select holds in shared memory, or nothing to drop
     }
     const int D = (int) K->ne[0], H_kv = (int) K->ne[2], n_head = (int) Q->ne[2], n_q = (int) Q->ne[1];
