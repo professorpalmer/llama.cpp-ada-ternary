@@ -5,6 +5,7 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <chrono>
 #include <cmath>
 #include <atomic>
 #include <map>
@@ -1542,7 +1543,10 @@ struct fa_psparse_cfg {
     bool    stat = false;
     bool    force = false;   // GGML_CUDA_FA_PREFILL_SPARSE_FORCE=1 (debug): engage even when nothing can be dropped
     bool    vis   = true;    // GGML_CUDA_FA_PREFILL_SPARSE_VIS=0: no tile map (every query tile computes the whole union)
+    bool    rowscores = false;   // GGML_CUDA_FA_PREFILL_SPARSE_ROWSCORES=1: the per-query score kernel even for QTILE % 64 == 0
 };
+
+static double t3_ms[4] = {};   // STAT: accumulated ms per stage (bounds, scores, selection, the rest of the T3 op)
 
 static const fa_psparse_cfg & fa_psparse() {
     static const fa_psparse_cfg c = [] {
@@ -1559,6 +1563,7 @@ static const fa_psparse_cfg & fa_psparse() {
         r.stat     = num("GGML_CUDA_FA_PREFILL_SPARSE_STAT", 0) != 0;
         r.force    = num("GGML_CUDA_FA_PREFILL_SPARSE_FORCE", 0) != 0;
         r.vis      = num("GGML_CUDA_FA_PREFILL_SPARSE_VIS", 1) != 0;
+        r.rowscores = num("GGML_CUDA_FA_PREFILL_SPARSE_ROWSCORES", 0) != 0;
         return r;
     }();
     return c;
@@ -1676,7 +1681,7 @@ static __device__ __forceinline__ int fa_psparse_block_sum(int v, int * red) {
 
 static __global__ void fa_psparse_select_tile(const float * __restrict__ ub, const int * __restrict__ last_cell,
         uint8_t * __restrict__ keep, const int n_q, const int n_pages, const int page, const int recent, const int keep_pages,
-        const int T) {
+        const int T, const bool tile_rows) {
     extern __shared__ uint32_t s_key[];               // [n_pages] keys, then [n_pages] bytes: top set
     uint8_t * s_top = (uint8_t *) (s_key + n_pages);
     __shared__ int red[32];
@@ -1695,7 +1700,7 @@ static __global__ void fa_psparse_select_tile(const float * __restrict__ ub, con
     __syncthreads();
     const int rp = s_rp;
     for (int p = threadIdx.x; p < rp; p += blockDim.x) {
-        s_key[p] = fa_psparse_key(ub[(int64_t) j0*n_pages + p]);
+        s_key[p] = fa_psparse_key(ub[(int64_t) (tile_rows ? (int) blockIdx.x : j0)*n_pages + p]);
         s_top[p] = 0;
     }
     __syncthreads();
@@ -1745,6 +1750,119 @@ static __global__ void fa_psparse_select_tile(const float * __restrict__ ub, con
     }
 }
 
+// T3 tile scores: block (page tile of 64, query block of 64, KV head h): for each Q head of h's group, the Quest bound
+// sc * sum_d max(q_d*mx_d, q_d*mn_d) of 64 queries x 64 pages, tiled over D in steps of 32 through shared memory (each
+// thread 4 queries x 4 pages); the max over the group's heads, then over the block's queries, goes to
+// out[h][qblock][page]. fa_psparse_tile_head_max then takes the max over KV heads and over the query blocks of a tile.
+// The same numbers as fa_sparse_scores followed by fa_sparse_tile_max (up to float summation order).
+static __global__ void __launch_bounds__(256) fa_psparse_tile_scores(const float * __restrict__ Q, const int8_t * __restrict__ mx,
+        const int8_t * __restrict__ mn, const half * __restrict__ sc, float * __restrict__ out, const int D, const int n_pages,
+        const int n_q, const int gqa, const int64_t q_s1, const int64_t q_s2, const int stride_pages) {
+    constexpr int TQ = 64, TP = 64, TD = 32;
+    __shared__ float sq[TQ][TD + 1];
+    __shared__ float sa[TP][TD + 1];
+    __shared__ float sb[TP][TD + 1];
+    __shared__ float sred[TQ][TP + 1];
+    const int p0 = blockIdx.x*TP, j0 = blockIdx.y*TQ, h = blockIdx.z;
+    const int tx = threadIdx.x % 16, ty = threadIdx.x / 16;   // pages tx*4.., queries ty*4..
+    float best[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            best[i][k] = -INFINITY;
+        }
+    }
+    float f[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int pg = p0 + tx*4 + k;
+        f[k] = pg < n_pages ? __half2float(sc[(int64_t) h*stride_pages + pg]) : 0.0f;
+    }
+    for (int g = 0; g < gqa; ++g) {
+        const int hq = h*gqa + g;
+        float acc[4][4] = {};
+        for (int d0 = 0; d0 < D; d0 += TD) {
+            for (int e = threadIdx.x; e < TQ*TD; e += blockDim.x) {
+                const int r = e / TD, c = e % TD;
+                const int j = j0 + r;
+                sq[r][c] = j < n_q ? Q[hq*q_s2 + (int64_t) j*q_s1 + d0 + c] : 0.0f;
+            }
+            for (int e = threadIdx.x; e < TP*TD; e += blockDim.x) {
+                const int r = e / TD, c = e % TD;
+                const int pg = p0 + r;
+                const int64_t o = ((int64_t) h*stride_pages + pg)*D + d0 + c;
+                sa[r][c] = pg < n_pages ? (float) mx[o] : 0.0f;
+                sb[r][c] = pg < n_pages ? (float) mn[o] : 0.0f;
+            }
+            __syncthreads();
+#pragma unroll 8
+            for (int c = 0; c < TD; ++c) {
+                float qv[4], av[4], bv[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    qv[i] = sq[ty*4 + i][c];
+                }
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    av[k] = sa[tx*4 + k][c];
+                    bv[k] = sb[tx*4 + k][c];
+                }
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        acc[i][k] += fmaxf(qv[i]*av[k], qv[i]*bv[k]);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                best[i][k] = fmaxf(best[i][k], acc[i][k]*f[k]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            sred[ty*4 + i][tx*4 + k] = j0 + ty*4 + i < n_q ? best[i][k] : -INFINITY;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < TP) {
+        const int pg = p0 + threadIdx.x;
+        float m = -INFINITY;
+        for (int r = 0; r < TQ; ++r) {
+            m = fmaxf(m, sred[r][threadIdx.x]);
+        }
+        if (pg < n_pages) {
+            out[((int64_t) h*gridDim.y + blockIdx.y)*n_pages + pg] = m;
+        }
+    }
+}
+
+// tile_ub[t][p] = max over KV heads and over the 64-query blocks of tile t (QTILE = 64*bpt) of out[h][block][p]
+static __global__ void fa_psparse_tile_head_max(const float * __restrict__ out, float * __restrict__ tile_ub, const int n_pages,
+        const int H_kv, const int n_blocks, const int bpt, const int n_tiles) {
+    const int p = blockIdx.x*blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (p >= n_pages || t >= n_tiles) {
+        return;
+    }
+    float m = -INFINITY;
+    for (int h = 0; h < H_kv; ++h) {
+        for (int b = t*bpt; b < min(n_blocks, (t + 1)*bpt); ++b) {
+            m = fmaxf(m, out[((int64_t) h*n_blocks + b)*n_pages + p]);
+        }
+    }
+    tile_ub[(int64_t) t*n_pages + p] = m;
+}
+
 struct fa_psparse_sel {
     ggml_cuda_pool_alloc<uint8_t> keep;    // [n_q][n_pages]
     ggml_cuda_pool_alloc<int>     d_pages; // kept pages, ascending
@@ -1789,6 +1907,16 @@ static bool fa_psparse_select(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_pool & pool = ctx.pool();
     sel.n_pages = n_pages;
     sel.keep.alloc((size_t) n_q*n_pages);   // outlives the temporaries below
+    // GGML_CUDA_FA_PREFILL_SPARSE_STAT: time per stage (bounds, scores, selection) from events; the union copy syncs anyway
+    static cudaEvent_t t3_ev[4] = {};
+    if (cfg.stat && !t3_ev[0]) {
+        for (cudaEvent_t & e : t3_ev) {
+            CUDA_CHECK(cudaEventCreate(&e));
+        }
+    }
+    if (cfg.stat) {
+        CUDA_CHECK(cudaEventRecord(t3_ev[0], stream));
+    }
     {
         // page bounds of all K pages, chunk by chunk (host rows copied into VRAM first)
         ggml_cuda_pool_alloc<uint8_t> bnd(pool, fa_sparse_bnd_bytes(H_kv, n_pages, D));
@@ -1816,22 +1944,42 @@ static bool fa_psparse_select(ggml_backend_cuda_context & ctx, const ggml_tensor
                     (int) n, page, (int) (kv0/page), n_pages);
             }
         }
-        ggml_cuda_pool_alloc<float> ub(pool, (size_t) n_q*n_pages);
-        fa_sparse_scores<<<dim3(n_pages, n_q), 256, 0, stream>>>((const float *) Q->data, mx, mn, sc, ub.get(), D, n_pages,
-            n_head, gqa, (int64_t) (Q->nb[1]/sizeof(float)), (int64_t) (Q->nb[2]/sizeof(float)), n_pages);
-        if (cfg.qtile > 1 && n_q > 1) {
-            fa_sparse_tile_max<<<dim3((n_pages + 255)/256, (n_q + cfg.qtile - 1)/cfg.qtile), 256, 0, stream>>>(ub.get(), n_q, n_pages, cfg.qtile);
+        if (cfg.stat) {
+            CUDA_CHECK(cudaEventRecord(t3_ev[1], stream));
+        }
+        // scores: tiled (QTILE a multiple of 64: one row per tile) or one row per query
+        const bool tiled = cfg.qtile % 64 == 0 && (size_t) n_pages*5 <= 48*1024 && D % 32 == 0 && !cfg.rowscores;
+        const int  n_tiles = (n_q + cfg.qtile - 1)/cfg.qtile;
+        const int  n_rows  = tiled ? n_tiles : n_q;
+        ggml_cuda_pool_alloc<float> ub(pool, (size_t) n_rows*n_pages);
+        if (tiled) {
+            const int n_blocks = (n_q + 63)/64;
+            ggml_cuda_pool_alloc<float> out(pool, (size_t) H_kv*n_blocks*n_pages);
+            fa_psparse_tile_scores<<<dim3((n_pages + 63)/64, n_blocks, H_kv), 256, 0, stream>>>((const float *) Q->data, mx, mn, sc,
+                out.get(), D, n_pages, n_q, gqa, (int64_t) (Q->nb[1]/sizeof(float)), (int64_t) (Q->nb[2]/sizeof(float)), n_pages);
+            fa_psparse_tile_head_max<<<dim3((n_pages + 255)/256, n_tiles), 256, 0, stream>>>(out.get(), ub.get(), n_pages, H_kv,
+                n_blocks, cfg.qtile/64, n_tiles);
+        } else {
+            fa_sparse_scores<<<dim3(n_pages, n_q), 256, 0, stream>>>((const float *) Q->data, mx, mn, sc, ub.get(), D, n_pages,
+                n_head, gqa, (int64_t) (Q->nb[1]/sizeof(float)), (int64_t) (Q->nb[2]/sizeof(float)), n_pages);
+            if (cfg.qtile > 1 && n_q > 1) {
+                fa_sparse_tile_max<<<dim3((n_pages + 255)/256, (n_q + cfg.qtile - 1)/cfg.qtile), 256, 0, stream>>>(ub.get(), n_q, n_pages, cfg.qtile);
+            }
+        }
+        if (cfg.stat) {
+            CUDA_CHECK(cudaEventRecord(t3_ev[2], stream));
+        }
+        if (sink_pages > 0) {
+            fa_psparse_sinks<<<dim3((sink_pages + 255)/256, n_rows), 256, 0, stream>>>(ub.get(), sel.keep.get(), n_rows, n_pages,
+                sink_pages, false);
         }
         const dim3 g_s((sink_pages + 255)/256, n_q);
-        if (sink_pages > 0) {
-            fa_psparse_sinks<<<g_s, 256, 0, stream>>>(ub.get(), sel.keep.get(), n_q, n_pages, sink_pages, false);
-        }
         ggml_cuda_pool_alloc<int> d_last(pool, (size_t) n_q);
         fa_psparse_last_packed<<<n_q, 256, 0, stream>>>((const uint32_t *) M->data, d_last.get(), (int) (n_kv/32),
             (int64_t) (M->nb[1]/sizeof(uint32_t)));
-        if (cfg.qtile > 1 && (size_t) n_pages*5 <= 48*1024) {
-            fa_psparse_select_tile<<<(n_q + cfg.qtile - 1)/cfg.qtile, 256, (size_t) n_pages*5, stream>>>(ub.get(), d_last.get(),
-                sel.keep.get(), n_q, n_pages, page, (int) cfg.recent, keep_pages, cfg.qtile);
+        if (tiled || (cfg.qtile > 1 && (size_t) n_pages*5 <= 48*1024)) {
+            fa_psparse_select_tile<<<n_tiles, 256, (size_t) n_pages*5, stream>>>(ub.get(), d_last.get(),
+                sel.keep.get(), n_q, n_pages, page, (int) cfg.recent, keep_pages, cfg.qtile, tiled);
         } else {
             fa_sparse_select<<<n_q, 256, n_pages*sizeof(float), stream>>>(ub.get(), d_last.get(), sel.keep.get(), n_pages, page,
                 (int) cfg.recent, keep_pages);
@@ -1843,7 +1991,17 @@ static bool fa_psparse_select(ggml_backend_cuda_context & ctx, const ggml_tensor
         fa_sparse_union<<<(n_pages + 255)/256, 256, 0, stream>>>(sel.keep.get(), any.get(), n_q, n_pages);
         std::vector<uint8_t> h_any(n_pages);
         CUDA_CHECK(cudaMemcpyAsync(h_any.data(), any.get(), n_pages, cudaMemcpyDeviceToHost, stream));
+        if (cfg.stat) {
+            CUDA_CHECK(cudaEventRecord(t3_ev[3], stream));
+        }
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (cfg.stat) {
+            float a = 0, b = 0, c = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&a, t3_ev[0], t3_ev[1]));
+            CUDA_CHECK(cudaEventElapsedTime(&b, t3_ev[1], t3_ev[2]));
+            CUDA_CHECK(cudaEventElapsedTime(&c, t3_ev[2], t3_ev[3]));
+            t3_ms[0] += a; t3_ms[1] += b; t3_ms[2] += c;
+        }
         sel.pages.clear();
         for (int p = 0; p < n_pages; ++p) {
             if (h_any[p]) {
@@ -1862,8 +2020,10 @@ static bool fa_psparse_select(ggml_backend_cuda_context & ctx, const ggml_tensor
         st_sum += (double) sel.pages.size() / n_pages;
         if (st_ops++ % 1024 == 0) {
             GGML_LOG_WARN("%s: T3 op %lld: %d queries, %lld cells, keep %d pages + sinks + window, union %zu of %d pages "
-                "(this op %.3f, mean %.3f)\n", __func__, (long long) st_ops, n_q, (long long) n_kv, keep_pages,
-                sel.pages.size(), n_pages, (double) sel.pages.size() / n_pages, st_sum / st_ops);
+                "(this op %.3f, mean %.3f); per op so far: bounds %.2f ms, scores %.2f ms, select %.2f ms, rest of op %.2f ms\n",
+                __func__, (long long) st_ops, n_q, (long long) n_kv, keep_pages, sel.pages.size(), n_pages,
+                (double) sel.pages.size() / n_pages, st_sum / st_ops, t3_ms[0]/st_ops, t3_ms[1]/st_ops, t3_ms[2]/st_ops,
+                t3_ms[3]/std::max<int64_t>(1, st_ops - 1));
         }
     }
     return true;
@@ -1914,6 +2074,11 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
     }
 
     GGML_ASSERT(!todo.empty());
+    const bool stat = sparse && fa_psparse().stat;
+    std::chrono::steady_clock::time_point t_loop;
+    if (stat) {
+        t_loop = std::chrono::steady_clock::now();
+    }
     for (size_t it = 0; it < todo.size(); ++it) {
         const int64_t ic  = todo[it];
         const int64_t kv0 = ic*C;
@@ -2036,6 +2201,10 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
         ggml_cuda_flash_attn_ext_mma_f16(ctx, &dst_c);
         ggml_cuda_fa_psparse_active = vis_prev;
         ctx.fattn_chunk = nullptr;
+    }
+    if (stat) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        t3_ms[3] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_loop).count();
     }
 }
 
