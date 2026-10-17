@@ -3150,7 +3150,17 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
-                        llama_set_prefill_dense_from(slot.task->n_tokens());
+                        // T5 prefill window: the dense-tail position is one value for the process, so only with one
+                        // slot; with more, it is never set and the window masks nothing (the full read)
+                        if (params_base.n_parallel == 1) {
+                            llama_set_prefill_dense_from(slot.task->n_tokens());
+                        } else if (getenv("LLAMA_PREFILL_WINDOW") != nullptr) {
+                            static bool warned = false;
+                            if (!warned) {
+                                warned = true;
+                                SRV_WRN("%s", "LLAMA_PREFILL_WINDOW is ignored with more than one slot (-np > 1): prompts are read in full\n");
+                            }
+                        }
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());

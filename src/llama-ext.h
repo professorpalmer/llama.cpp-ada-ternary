@@ -150,7 +150,12 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 // arbitrary set of intermediate layers in one concatenated row.
 LLAMA_API void llama_set_capture_layers(struct llama_context * ctx, const int32_t * layer_ids, size_t n_layers);
 
-// prefill window (T5, experimental): the server gives the prompt length before it reads a prompt (no effect unless LLAMA_PREFILL_WINDOW is set)
+// prefill window (T5, experimental): the server gives the prompt length before it reads a prompt (no effect unless
+// LLAMA_PREFILL_WINDOW is set). Notes:
+// - Only a process that calls this applies the window: the server does, with one slot only; llama-perplexity and the
+//   CLI do not, so LLAMA_PREFILL_WINDOW changes nothing there (a perplexity A/B of the window measures nothing).
+// - The window also applies to the MTP draft context's prompt ubatches (positions below the dense tail). With a window
+//   larger than the draft context's cells it masks nothing; a smaller one changes only the draft acceptance.
 LLAMA_API void llama_set_prefill_dense_from(int32_t n_prompt);
 
 LLAMA_API uint32_t llama_get_n_capture(struct llama_context * ctx);

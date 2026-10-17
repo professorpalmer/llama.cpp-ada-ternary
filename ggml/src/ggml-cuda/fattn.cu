@@ -1535,13 +1535,21 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
     const size_t ts = ggml_type_size(K->type);
 
     // cells that no row keeps add nothing to the softmax: run only the kept FATTN_KQ_STRIDE blocks, as runs of at most C
-    // cells (exact; GGML_CUDA_FA_CHUNK_SKIP=0: the fixed chunk grid)
-    static const bool skip_on = [] { const char * e = getenv("GGML_CUDA_FA_CHUNK_SKIP"); return !e || atoi(e) != 0; }();
+    // cells (exact; GGML_CUDA_FA_CHUNK_SKIP=0: the fixed chunk grid). On by default only with the T5 prefill window
+    // (LLAMA_PREFILL_WINDOW): without it a causal prefill mask has no fully masked block, so the scan and its host sync
+    // would only cost time, and the default path keeps the fixed grid by construction (release review, #138)
+    static const bool skip_on = [] {
+        const char * e = getenv("GGML_CUDA_FA_CHUNK_SKIP");
+        return e ? atoi(e) != 0 : getenv("LLAMA_PREFILL_WINDOW") != nullptr;
+    }();
     std::vector<std::pair<int64_t, int64_t>> todo; // (first cell, cells)
     // the scan needs a host sync: not while the stream is captured into a CUDA graph
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
-    if (skip_on && mask && mask->type == GGML_TYPE_I32 && n_chunks > 1 && capture == cudaStreamCaptureStatusNone) {
+    // the scan reads mask rows with one stride (ne2 == ne3 == 1, as the chunked path already requires); any other shape
+    // takes the fixed grid, which is exact
+    if (skip_on && mask && mask->type == GGML_TYPE_I32 && mask->ne[2] == 1 && mask->ne[3] == 1 && n_chunks > 1 &&
+        capture == cudaStreamCaptureStatusNone) {
         const int64_t B        = FATTN_KQ_STRIDE;
         const int64_t n_blocks = n_kv/B;
         ggml_cuda_pool_alloc<int> any(pool, n_blocks);
