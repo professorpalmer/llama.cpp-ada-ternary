@@ -208,7 +208,8 @@ struct server_fast_read_cfg {
     int lex   = 0;   // > 0: blocks also score by the question's rare token n-grams found in them; block score =
                      // attention / max attention + (lex / 100) x lexical / max lexical (0: attention only)
     int lexq  = 48;  // the question window: this many tokens before the last <|im_end|>
-    int lexn  = 3;   // n-gram length in tokens
+    int lexn  = 3;   // the longest n-gram length in tokens
+    int lexmin = 0;  // the shortest n-gram length (0: lexn only)
     int lexonly = 0; // 1: no scoring pass; blocks rank by the lexical part only (needs lex > 0)
     int lexnb = 0;   // keep this many blocks on each side of every block with a lexical hit (before the ranked fill)
     int lexdf = 0;   // > 0: only n-grams found at most this many times before the question count (common phrases of the
@@ -249,6 +250,7 @@ static const server_fast_read_cfg & server_fast_read() {
                 if (k == "lex")    { r.lex = v; }
                 if (k == "lexq")   { r.lexq = std::max(1, v); }
                 if (k == "lexn")   { r.lexn = std::max(1, v); }
+                if (k == "lexmin") { r.lexmin = std::max(0, v); }
                 if (k == "lexonly") { r.lexonly = v; }
                 if (k == "lexnb")  { r.lexnb = std::max(0, v); }
                 if (k == "lexdf")  { r.lexdf = std::max(0, v); }
@@ -3825,40 +3827,43 @@ private:
                     break;
                 }
             }
-            const int qn = cfg.lexn;
             const int q0 = std::max(0, q_end - cfg.lexq);
-            auto gram = [&](int i) {
-                uint64_t h = 1469598103934665603ULL;
-                for (int k2 = 0; k2 < qn; ++k2) {
-                    h ^= (uint64_t) (uint32_t) toks[i + k2];
-                    h *= 1099511628211ULL;
-                }
-                return h;
-            };
-            std::unordered_map<uint64_t, int> qg;
-            for (int i = q0; i + qn <= q_end; ++i) {
-                qg[gram(i)] = 0;
-            }
-            std::vector<int> hits;
-            for (int i = 0; i + qn <= q0; ++i) {
-                auto it = qg.find(gram(i));
-                if (it != qg.end()) {
-                    it->second++;
-                    hits.push_back(i);
-                }
-            }
             lexs.assign(N, 0.0f);
             n_lex_hits = 0;
-            for (int i : hits) {
-                const int df = qg[gram(i)];
-                if (cfg.lexdf > 0 && df > cfg.lexdf) {
-                    continue;
+            // every n-gram length from lexmin to lexn: short ones catch a rare identifier on its own, long ones a
+            // specific phrase whose shorter pieces are common (digits are separate tokens: "vault 15" needs n = 4)
+            for (int qn = cfg.lexmin > 0 ? cfg.lexmin : cfg.lexn; qn <= cfg.lexn; ++qn) {
+                auto gram = [&](int i) {
+                    uint64_t h = 1469598103934665603ULL ^ (uint64_t) qn;
+                    for (int k2 = 0; k2 < qn; ++k2) {
+                        h ^= (uint64_t) (uint32_t) toks[i + k2];
+                        h *= 1099511628211ULL;
+                    }
+                    return h;
+                };
+                std::unordered_map<uint64_t, int> qg;
+                for (int i = q0; i + qn <= q_end; ++i) {
+                    qg[gram(i)] = 0;
                 }
-                const float w = logf((float) (q0 + 1)/(float) (df + 1));
-                for (int k2 = 0; k2 < qn; ++k2) {
-                    lexs[i + k2] += w;
+                std::vector<int> hits;
+                for (int i = 0; i + qn <= q0; ++i) {
+                    auto it = qg.find(gram(i));
+                    if (it != qg.end()) {
+                        it->second++;
+                        hits.push_back(i);
+                    }
                 }
-                ++n_lex_hits;
+                for (int i : hits) {
+                    const int df = qg[gram(i)];
+                    if (cfg.lexdf > 0 && df > cfg.lexdf) {
+                        continue;
+                    }
+                    const float w = logf((float) (q0 + 1)/(float) (df + 1));
+                    for (int k2 = 0; k2 < qn; ++k2) {
+                        lexs[i + k2] += w;
+                    }
+                    ++n_lex_hits;
+                }
             }
         }
         std::vector<std::pair<float, int>> blocks;
