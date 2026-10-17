@@ -6,7 +6,10 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "llama-ext.h"
+
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
@@ -1750,6 +1753,74 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     }
 }
 
+// prefill window (T5, experimental, quality emulation): LLAMA_PREFILL_WINDOW="window=W[,sink=S][,tail=T]"
+// a ubatch that ends before the dense tail (n_prompt - T, set by the server) masks cells with S <= pos < p - W; tail and decode stay dense
+struct llama_prefill_window_cfg {
+    int32_t window = 0;
+    int32_t sink   = 1024;
+    int32_t tail   = 1024;
+};
+
+static const llama_prefill_window_cfg & prefill_window_cfg() {
+    static const llama_prefill_window_cfg cfg = [] {
+        llama_prefill_window_cfg c;
+        const char * e = getenv("LLAMA_PREFILL_WINDOW");
+        if (e == nullptr) {
+            return c;
+        }
+        const std::string s(e);
+        size_t i = 0;
+        while (i < s.size()) {
+            size_t j = s.find(',', i);
+            if (j == std::string::npos) {
+                j = s.size();
+            }
+            const std::string kv = s.substr(i, j - i);
+            const size_t eq = kv.find('=');
+            if (eq != std::string::npos) {
+                const std::string k = kv.substr(0, eq);
+                const int32_t     v = atoi(kv.c_str() + eq + 1);
+                if (k == "window") { c.window = v; }
+                if (k == "sink")   { c.sink   = v; }
+                if (k == "tail")   { c.tail   = v; }
+            }
+            i = j + 1;
+        }
+        LLAMA_LOG_WARN("%s: prefill window on (experimental): window %d, sink %d, tail %d\n", __func__, c.window, c.sink, c.tail);
+        return c;
+    }();
+    return cfg;
+}
+
+static std::atomic<int32_t> g_prefill_dense_from{0};
+
+void llama_set_prefill_dense_from(int32_t n_prompt) {
+    const auto & c = prefill_window_cfg();
+    g_prefill_dense_from = c.window > 0 ? std::max<int32_t>(0, n_prompt - c.tail) : 0;
+}
+
+struct prefill_window_state {
+    bool    on   = false;
+    int32_t w    = 0;
+    int32_t sink = 0;
+    int32_t pmax = -1;
+};
+
+static prefill_window_state prefill_window_for(const llama_ubatch * ubatch) {
+    const auto & c = prefill_window_cfg();
+    prefill_window_state st;
+    if (c.window <= 0) {
+        return st;
+    }
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        st.pmax = std::max<int32_t>(st.pmax, ubatch->pos[i]);
+    }
+    st.on   = st.pmax < g_prefill_dense_from.load();
+    st.w    = c.window;
+    st.sink = c.sink;
+    return st;
+}
+
 struct args_set_input_kq_mask {
     const llama_hparams & hparams;
     const llama_ubatch  * ubatch;
@@ -1792,6 +1863,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
     }
+
+    const prefill_window_state pw = prefill_window_for(ubatch);
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
@@ -1869,7 +1942,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 if (!alibi) {
                     if (!prev) {
                         // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
-                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
+                        // (prefill window: also the cells near the window edge, which moves with p1)
+                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id] ||
+                            (pw.on && p0 + pw.w + 32 >= seq_pos_min[seq_id] && p0 + pw.w <= pw.pmax + 32)) {
                             idxs.push_back(j);
                         }
                     }
@@ -1898,6 +1973,10 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
                         goto skip;
                     }
+                }
+
+                if (pw.on && p0 >= pw.sink && p0 + pw.w < p1) {
+                    goto skip;
                 }
 
                 if (alibi) {
@@ -1980,6 +2059,8 @@ static void set_input_kq_mask_packed_impl(const args_set_input_kq_mask & args, u
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
     }
 
+    const prefill_window_state pw = prefill_window_for(ubatch);
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
@@ -2035,7 +2116,8 @@ static void set_input_kq_mask_packed_impl(const args_set_input_kq_mask & args, u
                     p0 = cells.pos_get(j);
 
                     if (!prev) {
-                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
+                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id] ||
+                            (pw.on && p0 + pw.w + 32 >= seq_pos_min[seq_id] && p0 + pw.w <= pw.pmax + 32)) {
                             idxs.push_back(j);
                         }
                     }
@@ -2056,6 +2138,10 @@ static void set_input_kq_mask_packed_impl(const args_set_input_kq_mask & args, u
                         if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
                             keep = false;
                         }
+                    }
+
+                    if (keep && pw.on && p0 >= pw.sink && p0 + pw.w < p1) {
+                        keep = false;
                     }
                 }
 

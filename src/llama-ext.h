@@ -150,6 +150,9 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 // arbitrary set of intermediate layers in one concatenated row.
 LLAMA_API void llama_set_capture_layers(struct llama_context * ctx, const int32_t * layer_ids, size_t n_layers);
 
+// prefill window (T5, experimental): the server gives the prompt length before it reads a prompt (no effect unless LLAMA_PREFILL_WINDOW is set)
+LLAMA_API void llama_set_prefill_dense_from(int32_t n_prompt);
+
 LLAMA_API uint32_t llama_get_n_capture(struct llama_context * ctx);
 
 // mirrors llama_get_embeddings_pre_norm / _ith
