@@ -1173,6 +1173,12 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
+    if (inp_attn->self_kq_mask_dense) {
+        llama_prefill_window_suppress(true);
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask_dense, ubatch, cparams.causal_attn);
+        llama_prefill_window_suppress(false);
+    }
+
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
@@ -1195,6 +1201,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    if (inp_attn->self_kq_mask_dense) {
+        res &= can_reuse_kq_mask(inp_attn->self_kq_mask_dense, mctx->get_attn(), params.ubatch, params.cparams);
+    }
 
     res &= inp_rs->can_reuse_rs(mctx->get_recr(), params);
 
