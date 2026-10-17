@@ -3884,11 +3884,19 @@ private:
             return x.first > y.first || (x.first == y.first && x.second < y.second);
         });
         int n_mid = 0;
-        // lexnb: the neighbors of every block with a lexical hit first (a fact can straddle a block boundary)
+        // lexnb: the neighbors of the blocks with a lexical hit first, best lexical score first (a fact can straddle a
+        // block boundary; position order ran out of budget on common hits before the asked one, round 5)
         if (cfg.lex > 0 && cfg.lexnb > 0) {
-            for (size_t ib = 0; ib < b_lex.size() && n_mid < cfg.keep; ++ib) {
-                if (b_lex[ib] <= 0.0f) {
-                    continue;
+            std::vector<int> order;
+            for (size_t ib = 0; ib < b_lex.size(); ++ib) {
+                if (b_lex[ib] > 0.0f) {
+                    order.push_back((int) ib);
+                }
+            }
+            std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return b_lex[x] > b_lex[y]; });
+            for (const int ib : order) {
+                if (n_mid >= cfg.keep) {
+                    break;
                 }
                 for (int d = -cfg.lexnb; d <= cfg.lexnb && n_mid < cfg.keep; ++d) {
                     const int jb = (int) ib + d;
