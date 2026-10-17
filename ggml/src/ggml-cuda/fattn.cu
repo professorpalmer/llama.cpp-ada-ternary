@@ -1538,7 +1538,10 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
     // cells (exact; GGML_CUDA_FA_CHUNK_SKIP=0: the fixed chunk grid)
     static const bool skip_on = [] { const char * e = getenv("GGML_CUDA_FA_CHUNK_SKIP"); return !e || atoi(e) != 0; }();
     std::vector<std::pair<int64_t, int64_t>> todo; // (first cell, cells)
-    if (skip_on && mask && mask->type == GGML_TYPE_I32 && n_chunks > 1) {
+    // the scan needs a host sync: not while the stream is captured into a CUDA graph
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (skip_on && mask && mask->type == GGML_TYPE_I32 && n_chunks > 1 && capture == cudaStreamCaptureStatusNone) {
         const int64_t B        = FATTN_KQ_STRIDE;
         const int64_t n_blocks = n_kv/B;
         ggml_cuda_pool_alloc<int> any(pool, n_blocks);
