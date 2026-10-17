@@ -19,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <unordered_map>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -204,6 +205,10 @@ struct server_batch {
 struct server_fast_read_cfg {
     int keep = 0, min_tokens = 32768, sinks = 256, window = 2048, layers = 8, probe = 7, rows = 32, block = 32;
     int bmax = 0;
+    int lex   = 0;   // > 0: blocks also score by the question's rare token n-grams found in them; block score =
+                     // attention / max attention + (lex / 100) x lexical / max lexical (0: attention only)
+    int lexq  = 48;  // the question window: this many tokens before the last <|im_end|>
+    int lexn  = 3;   // n-gram length in tokens
     int qrows = 0;  // 1: the probe rows are the last `rows` tokens of the last user message (before its <|im_end|>), not the
                     // end of the prompt (the chat template's assistant / think tags); the scoring pass stops there   // 1: a block's score is its best token, not the sum (diagnostics 10-17: keeps the asked fact more often)
 };
@@ -237,6 +242,9 @@ static const server_fast_read_cfg & server_fast_read() {
                 if (k == "block")  { r.block = std::max(1, v); }
                 if (k == "bmax")   { r.bmax = v; }
                 if (k == "qrows")  { r.qrows = v; }
+                if (k == "lex")    { r.lex = v; }
+                if (k == "lexq")   { r.lexq = std::max(1, v); }
+                if (k == "lexn")   { r.lexn = std::max(1, v); }
             }
             p = q + 1;
         }
@@ -3793,13 +3801,67 @@ private:
         const int w_beg = std::max(s_end, N - cfg.window);
         for (int i = 0; i < s_end; ++i) { kept[i] = 1; }
         for (int i = w_beg; i < N; ++i) { kept[i] = 1; }
+        // lexical part (lex > 0): every n-gram of the question window that also occurs earlier in the prompt marks its
+        // tokens with log((n + 1) / (df + 1)), df = its count before the question (rare n-grams count most)
+        std::vector<float> lexs;
+        int n_lex_hits = 0;
+        if (cfg.lex > 0) {
+            int q_end = N;
+            for (int i = N - 1; i >= std::max(0, N - 4096); --i) {
+                if (common_token_to_piece(ctx_tgt, toks[i], true) == "<|im_end|>") {
+                    q_end = i;
+                    break;
+                }
+            }
+            const int qn = cfg.lexn;
+            const int q0 = std::max(0, q_end - cfg.lexq);
+            auto gram = [&](int i) {
+                uint64_t h = 1469598103934665603ULL;
+                for (int k2 = 0; k2 < qn; ++k2) {
+                    h ^= (uint64_t) (uint32_t) toks[i + k2];
+                    h *= 1099511628211ULL;
+                }
+                return h;
+            };
+            std::unordered_map<uint64_t, int> qg;
+            for (int i = q0; i + qn <= q_end; ++i) {
+                qg[gram(i)] = 0;
+            }
+            std::vector<int> hits;
+            for (int i = 0; i + qn <= q0; ++i) {
+                auto it = qg.find(gram(i));
+                if (it != qg.end()) {
+                    it->second++;
+                    hits.push_back(i);
+                }
+            }
+            lexs.assign(N, 0.0f);
+            for (int i : hits) {
+                const float w = logf((float) (q0 + 1)/(float) (qg[gram(i)] + 1));
+                for (int k2 = 0; k2 < qn; ++k2) {
+                    lexs[i + k2] += w;
+                }
+            }
+            n_lex_hits = (int) hits.size();
+        }
         std::vector<std::pair<float, int>> blocks;
+        std::vector<float> b_attn, b_lex;
         for (int i = s_end; i < w_beg; i += cfg.block) {
-            float sum = 0.0f;
+            float sum = 0.0f, lsum = 0.0f;
             for (int j = i; j < std::min(i + cfg.block, w_beg); ++j) {
                 sum = cfg.bmax ? std::max(sum, score[j]) : sum + score[j];
+                lsum += lexs.empty() ? 0.0f : lexs[j];
             }
             blocks.push_back({ sum, i });
+            b_attn.push_back(sum);
+            b_lex.push_back(lsum);
+        }
+        if (cfg.lex > 0 && !blocks.empty()) {
+            const float ma = std::max(1e-20f, *std::max_element(b_attn.begin(), b_attn.end()));
+            const float ml = std::max(1e-20f, *std::max_element(b_lex.begin(), b_lex.end()));
+            for (size_t ib = 0; ib < blocks.size(); ++ib) {
+                blocks[ib].first = b_attn[ib]/ma + 0.01f*(float) cfg.lex*b_lex[ib]/ml;
+            }
         }
         std::sort(blocks.begin(), blocks.end(), [](const std::pair<float, int> & x, const std::pair<float, int> & y) {
             return x.first > y.first || (x.first == y.first && x.second < y.second);
@@ -3825,8 +3887,8 @@ private:
         const_cast<server_task *>(slot.task.get())->tokens = server_tokens(out, false);
         slot.t_fast_read_ms = (ggml_time_us() - t0) / 1000.0;
         SLT_WRN(slot, "fast read: %d -> %d tokens (sinks %d, window %d, %d blocks of %d), scoring pass %.1f s (%d blocks), "
-            "scores %.1f s\n", N, (int) out.size(), s_end, N - w_beg, (int) ((n_mid + cfg.block - 1)/cfg.block), cfg.block,
-            (t1 - t0)/1e6, cfg.layers, (t2 - t1)/1e6);
+            "scores %.1f s; lexical n-gram hits %d\n", N, (int) out.size(), s_end, N - w_beg, (int) ((n_mid + cfg.block - 1)/cfg.block), cfg.block,
+            (t1 - t0)/1e6, cfg.layers, (t2 - t1)/1e6, n_lex_hits);
     }
 
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
