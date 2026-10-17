@@ -1534,34 +1534,41 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
     const to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
     const size_t ts = ggml_type_size(K->type);
 
-    // a chunk that no row keeps adds nothing to the softmax: skip it (exact; GGML_CUDA_FA_CHUNK_SKIP=0: off)
+    // cells that no row keeps add nothing to the softmax: run only the kept FATTN_KQ_STRIDE blocks, as runs of at most C
+    // cells (exact; GGML_CUDA_FA_CHUNK_SKIP=0: the fixed chunk grid)
     static const bool skip_on = [] { const char * e = getenv("GGML_CUDA_FA_CHUNK_SKIP"); return !e || atoi(e) != 0; }();
-    std::vector<int64_t> todo;
+    std::vector<std::pair<int64_t, int64_t>> todo; // (first cell, cells)
     if (skip_on && mask && mask->type == GGML_TYPE_I32 && n_chunks > 1) {
-        ggml_cuda_pool_alloc<int> any(pool, n_chunks);
-        CUDA_CHECK(cudaMemsetAsync(any.get(), 0, n_chunks*sizeof(int), stream));
+        const int64_t B        = FATTN_KQ_STRIDE;
+        const int64_t n_blocks = n_kv/B;
+        ggml_cuda_pool_alloc<int> any(pool, n_blocks);
+        CUDA_CHECK(cudaMemsetAsync(any.get(), 0, n_blocks*sizeof(int), stream));
         const int64_t rows = mask->ne[1]*mask->ne[2]*mask->ne[3];
-        fa_chunk_any<<<(unsigned) n_chunks, 256, 0, stream>>>((const uint32_t *) mask->data, any.get(), mask->ne[0], rows,
-            (int64_t) (mask->nb[1]/sizeof(uint32_t)), C/32);
-        std::vector<int> h(n_chunks);
-        CUDA_CHECK(cudaMemcpyAsync(h.data(), any.get(), n_chunks*sizeof(int), cudaMemcpyDeviceToHost, stream));
+        fa_chunk_any<<<(unsigned) n_blocks, 256, 0, stream>>>((const uint32_t *) mask->data, any.get(), mask->ne[0], rows,
+            (int64_t) (mask->nb[1]/sizeof(uint32_t)), B/32);
+        std::vector<int> h(n_blocks);
+        CUDA_CHECK(cudaMemcpyAsync(h.data(), any.get(), n_blocks*sizeof(int), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        for (int64_t ic = 0; ic < n_chunks; ++ic) {
-            if (h[ic]) {
-                todo.push_back(ic);
+        for (int64_t ib = 0; ib < n_blocks; ++ib) {
+            if (!h[ib]) {
+                continue;
+            }
+            if (!todo.empty() && todo.back().first + todo.back().second == ib*B && todo.back().second + B <= C) {
+                todo.back().second += B;
+            } else {
+                todo.push_back({ib*B, B});
             }
         }
     }
     if (todo.empty()) {
         for (int64_t ic = 0; ic < n_chunks; ++ic) {
-            todo.push_back(ic);
+            todo.push_back({ic*C, std::min(C, n_kv - ic*C)});
         }
     }
 
     for (size_t it = 0; it < todo.size(); ++it) {
-        const int64_t ic  = todo[it];
-        const int64_t kv0 = ic*C;
-        const int64_t n   = std::min(C, n_kv - kv0);
+        const int64_t kv0 = todo[it].first;
+        const int64_t n   = todo[it].second;
 
         // quantized chunk views of K and V (cells [kv0, kv0 + n))
         ggml_tensor Kc = *K;
