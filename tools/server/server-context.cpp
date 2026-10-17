@@ -211,6 +211,8 @@ struct server_fast_read_cfg {
     int lexn  = 3;   // n-gram length in tokens
     int lexonly = 0; // 1: no scoring pass; blocks rank by the lexical part only (needs lex > 0)
     int lexnb = 0;   // keep this many blocks on each side of every block with a lexical hit (before the ranked fill)
+    int lexdf = 0;   // > 0: only n-grams found at most this many times before the question count (common phrases of the
+                     // document, e.g. its filler or boilerplate, match everywhere and drown the rare ones)
     int qrows = 0;  // 1: the probe rows are the last `rows` tokens of the last user message (before its <|im_end|>), not the
                     // end of the prompt (the chat template's assistant / think tags); the scoring pass stops there   // 1: a block's score is its best token, not the sum (diagnostics 10-17: keeps the asked fact more often)
 };
@@ -249,6 +251,7 @@ static const server_fast_read_cfg & server_fast_read() {
                 if (k == "lexn")   { r.lexn = std::max(1, v); }
                 if (k == "lexonly") { r.lexonly = v; }
                 if (k == "lexnb")  { r.lexnb = std::max(0, v); }
+                if (k == "lexdf")  { r.lexdf = std::max(0, v); }
             }
             p = q + 1;
         }
@@ -3845,13 +3848,18 @@ private:
                 }
             }
             lexs.assign(N, 0.0f);
+            n_lex_hits = 0;
             for (int i : hits) {
-                const float w = logf((float) (q0 + 1)/(float) (qg[gram(i)] + 1));
+                const int df = qg[gram(i)];
+                if (cfg.lexdf > 0 && df > cfg.lexdf) {
+                    continue;
+                }
+                const float w = logf((float) (q0 + 1)/(float) (df + 1));
                 for (int k2 = 0; k2 < qn; ++k2) {
                     lexs[i + k2] += w;
                 }
+                ++n_lex_hits;
             }
-            n_lex_hits = (int) hits.size();
         }
         std::vector<std::pair<float, int>> blocks;
         std::vector<float> b_attn, b_lex;
