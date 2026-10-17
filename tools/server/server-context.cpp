@@ -203,6 +203,7 @@ struct server_batch {
 // scored again from the full input.
 struct server_fast_read_cfg {
     int keep = 0, min_tokens = 32768, sinks = 256, window = 2048, layers = 8, probe = 7, rows = 32, block = 32;
+    int bmax = 0;   // 1: a block's score is its best token, not the sum (diagnostics 10-17: keeps the asked fact more often)
 };
 
 static const server_fast_read_cfg & server_fast_read() {
@@ -232,6 +233,7 @@ static const server_fast_read_cfg & server_fast_read() {
                 if (k == "probe")  { r.probe = v; }
                 if (k == "rows")   { r.rows = v; }
                 if (k == "block")  { r.block = std::max(1, v); }
+                if (k == "bmax")   { r.bmax = v; }
             }
             p = q + 1;
         }
@@ -3750,6 +3752,16 @@ private:
         if (ok) {
             ok = llama_fast_read_scores(ctx_tgt, cfg.probe, N, score.data()) == 0;
         }
+        if (const char * dump = getenv("LLAMA_FAST_READ_DUMP")) {   // diagnostics: the prompt tokens and the summed scores
+            if (FILE * f = fopen((std::string(dump) + ".tok.i32").c_str(), "wb")) {
+                fwrite(toks.data(), sizeof(llama_token), toks.size(), f);
+                fclose(f);
+            }
+            if (FILE * f = fopen((std::string(dump) + ".score.f32").c_str(), "wb")) {
+                fwrite(score.data(), sizeof(float), score.size(), f);
+                fclose(f);
+            }
+        }
         llama_set_fast_read(ctx_tgt, 0, -1, 0);
         llama_memory_clear(mem, true);
         const int64_t t2 = ggml_time_us();
@@ -3768,7 +3780,7 @@ private:
         for (int i = s_end; i < w_beg; i += cfg.block) {
             float sum = 0.0f;
             for (int j = i; j < std::min(i + cfg.block, w_beg); ++j) {
-                sum += score[j];
+                sum = cfg.bmax ? std::max(sum, score[j]) : sum + score[j];
             }
             blocks.push_back({ sum, i });
         }

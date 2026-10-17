@@ -1456,6 +1456,15 @@ int32_t llama_context::fast_read_scores(int32_t il, int32_t n_cells, float * out
         }
     }
     // pass 2: weights summed over rows and heads
+    // LLAMA_FAST_READ_DUMP=path (diagnostics): also write the per-head weights (summed over rows) as float32 [H][n_cells]
+    // to path.il<il>.heads.f32, to test other ways to combine heads offline
+    const char * dump = getenv("LLAMA_FAST_READ_DUMP");
+    // LLAMA_FAST_READ_DUMP_ROWS=1: per (row, head) instead, float32 [R*H][n_cells] (large: 750 MB at 245k, 32 rows)
+    const bool dump_rows = dump && getenv("LLAMA_FAST_READ_DUMP_ROWS") != nullptr;
+    std::vector<float> per_head;
+    if (dump) {
+        per_head.assign((size_t) (dump_rows ? RH : H)*n_cells, 0.0f);
+    }
     auto pass2 = [&](int t) {
         std::vector<float> krow(n_embd_k), l(RH);
         for (int64_t c = t; c < n_cells; c += n_thr) {
@@ -1463,7 +1472,11 @@ int32_t llama_context::fast_read_scores(int32_t il, int32_t n_cells, float * out
             logits_of(krow.data(), l.data());
             float acc = 0.0f;
             for (int i = 0; i < RH; ++i) {
-                acc += expf(l[i] - M[i])/S[i];
+                const float w = expf(l[i] - M[i])/S[i];
+                acc += w;
+                if (dump) {
+                    per_head[(size_t) (dump_rows ? i : i % H)*n_cells + c] += w;
+                }
             }
             out[c] = acc;
         }
@@ -1475,6 +1488,15 @@ int32_t llama_context::fast_read_scores(int32_t il, int32_t n_cells, float * out
         }
         for (auto & x : th) {
             x.join();
+        }
+    }
+    if (dump) {
+        const std::string fn = std::string(dump) + ".il" + std::to_string(il) + (dump_rows ? ".rowheads.f32" : ".heads.f32");
+        if (FILE * f = fopen(fn.c_str(), "wb")) {
+            fwrite(per_head.data(), sizeof(float), per_head.size(), f);
+            fclose(f);
+            LLAMA_LOG_WARN("%s: wrote %d x %d cells to %s (rows %d, heads %d)\n", __func__, dump_rows ? RH : H, n_cells,
+                fn.c_str(), R, H);
         }
     }
     return 0;
