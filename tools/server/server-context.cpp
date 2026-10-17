@@ -209,6 +209,8 @@ struct server_fast_read_cfg {
                      // attention / max attention + (lex / 100) x lexical / max lexical (0: attention only)
     int lexq  = 48;  // the question window: this many tokens before the last <|im_end|>
     int lexn  = 3;   // n-gram length in tokens
+    int lexonly = 0; // 1: no scoring pass; blocks rank by the lexical part only (needs lex > 0)
+    int lexnb = 0;   // keep this many blocks on each side of every block with a lexical hit (before the ranked fill)
     int qrows = 0;  // 1: the probe rows are the last `rows` tokens of the last user message (before its <|im_end|>), not the
                     // end of the prompt (the chat template's assistant / think tags); the scoring pass stops there   // 1: a block's score is its best token, not the sum (diagnostics 10-17: keeps the asked fact more often)
 };
@@ -245,6 +247,8 @@ static const server_fast_read_cfg & server_fast_read() {
                 if (k == "lex")    { r.lex = v; }
                 if (k == "lexq")   { r.lexq = std::max(1, v); }
                 if (k == "lexn")   { r.lexn = std::max(1, v); }
+                if (k == "lexonly") { r.lexonly = v; }
+                if (k == "lexnb")  { r.lexnb = std::max(0, v); }
             }
             p = q + 1;
         }
@@ -3751,7 +3755,10 @@ private:
                 n_score = N;
             }
         }
-        llama_set_fast_read(ctx_tgt, cfg.layers, cfg.probe, cfg.rows);
+        const bool lex_only = cfg.lexonly && cfg.lex > 0;
+        if (!lex_only) {
+            llama_set_fast_read(ctx_tgt, cfg.layers, cfg.probe, cfg.rows);
+        }
         const int n_batch = llama_n_batch(ctx_tgt);
         llama_batch b = llama_batch_init(n_batch, 0, 1);
         const int tail = std::min(n_score, std::max(cfg.rows, 1));
@@ -3768,13 +3775,15 @@ private:
                 }
             }
         };
-        run(0, n_score - tail);
-        run(n_score - tail, n_score);
+        if (!lex_only) {
+            run(0, n_score - tail);
+            run(n_score - tail, n_score);
+        }
         llama_batch_free(b);
         const int64_t t1 = ggml_time_us();
 
         std::vector<float> score(N, 0.0f);
-        if (ok) {
+        if (ok && !lex_only) {
             ok = llama_fast_read_scores(ctx_tgt, cfg.probe, n_score, score.data()) == 0;
         }
         if (const char * dump = getenv("LLAMA_FAST_READ_DUMP")) {   // diagnostics: the prompt tokens and the summed scores
@@ -3867,13 +3876,36 @@ private:
             return x.first > y.first || (x.first == y.first && x.second < y.second);
         });
         int n_mid = 0;
+        // lexnb: the neighbors of every block with a lexical hit first (a fact can straddle a block boundary)
+        if (cfg.lex > 0 && cfg.lexnb > 0) {
+            for (size_t ib = 0; ib < b_lex.size() && n_mid < cfg.keep; ++ib) {
+                if (b_lex[ib] <= 0.0f) {
+                    continue;
+                }
+                for (int d = -cfg.lexnb; d <= cfg.lexnb && n_mid < cfg.keep; ++d) {
+                    const int jb = (int) ib + d;
+                    if (jb < 0 || jb >= (int) b_lex.size()) {
+                        continue;
+                    }
+                    const int j0 = s_end + jb*cfg.block;
+                    for (int j = j0; j < std::min(j0 + cfg.block, w_beg); ++j) {
+                        if (!kept[j]) {
+                            kept[j] = 1;
+                            ++n_mid;
+                        }
+                    }
+                }
+            }
+        }
         for (const auto & bl : blocks) {
             if (n_mid >= cfg.keep) {
                 break;
             }
             for (int j = bl.second; j < std::min(bl.second + cfg.block, w_beg); ++j) {
-                kept[j] = 1;
-                ++n_mid;
+                if (!kept[j]) {
+                    kept[j] = 1;
+                    ++n_mid;
+                }
             }
         }
         llama_tokens out;
