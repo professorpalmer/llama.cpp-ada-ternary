@@ -126,6 +126,12 @@ struct llama_context {
     // list to disable. the concatenation order follows the order of layer_ids.
     void set_capture_layers(const std::vector<int32_t> & layer_ids);
 
+    // fast read (T4): see llama_set_fast_read / llama_fast_read_scores (llama-ext.h)
+    void    set_fast_read(int32_t layer_limit, int32_t probe_layer, int32_t probe_rows);
+    int32_t fast_read_scores(int32_t il, int32_t n_cells, float * out);
+    std::vector<float> q_probe;   // [rows][n_head][head_dim] from the last decoded ubatch
+    int32_t q_probe_rows = 0, q_probe_heads = 0, q_probe_dim = 0;
+
     // dspark drafter: stage the target-tap context window consumed by the next
     // decode() call. feat is [n_ctx_rows * n_embd_cap] row-major (row i is
     // position pos[i]'s raw concatenated multi-layer tap feature, pre dspark.fc).

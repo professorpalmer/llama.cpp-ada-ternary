@@ -175,6 +175,13 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    // fast read (T4): the whole K tensor of model layer il ([n_embd_k_gqa, kv_size, n_stream]), nullptr if the layer has
+    // no KV in this cache
+    ggml_tensor * get_k_raw(int32_t il) const {
+        const auto it = map_layer_ids.find(il);
+        return it == map_layer_ids.end() ? nullptr : layers[it->second].k;
+    }
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location

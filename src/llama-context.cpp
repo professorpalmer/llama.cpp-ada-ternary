@@ -24,6 +24,8 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 //
 // llama_context
@@ -1339,6 +1341,145 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_fast_read(int32_t layer_limit, int32_t probe_layer, int32_t probe_rows) {
+    if (cparams.fr_layer_limit == layer_limit && cparams.fr_probe_layer == probe_layer && cparams.fr_probe_rows == probe_rows) {
+        return;
+    }
+    cparams.fr_layer_limit = std::max(0, layer_limit);
+    cparams.fr_probe_layer = probe_layer;
+    cparams.fr_probe_rows  = std::max(0, probe_rows);
+    q_probe_rows = 0;
+    // the graph topology changes (fewer blocks, one more output): re-derive the scheduler's split as for the capture tap
+    sched_need_reserve = true;
+}
+
+// fast read (T4): per KV cell c in [0, n_cells), the attention weight the probe Q rows give c at model layer il, summed
+// over rows and heads: sum_{r,h} softmax_c(scale * q[r,h] . k[c, h / gqa]). Reads the layer's K (any type with a CPU
+// to_float) once per pass; two passes (row max / sum, then weights), so nothing of size rows x heads x cells is kept.
+// Assumes one sequence filled from cell 0 in order (cell c holds position c), as after a clear + one prompt.
+int32_t llama_context::fast_read_scores(int32_t il, int32_t n_cells, float * out) {
+    synchronize();
+    if (q_probe_rows <= 0 || q_probe.empty()) {
+        LLAMA_LOG_ERROR("%s: no probe rows (llama_set_fast_read with probe_rows > 0, then decode)\n", __func__);
+        return -1;
+    }
+    llama_kv_cache * kv = nullptr;
+    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        kv = hyb->get_mem_attn();
+    } else {
+        kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    }
+    ggml_tensor * k = kv ? kv->get_k_raw(il) : nullptr;
+    if (k == nullptr || n_cells <= 0 || n_cells > k->ne[1]) {
+        LLAMA_LOG_ERROR("%s: layer %d has no K in this context, or %d cells is out of range\n", __func__, il, n_cells);
+        return -1;
+    }
+    const auto * tt = ggml_get_type_traits(k->type);
+    if (k->type != GGML_TYPE_F32 && (tt == nullptr || tt->to_float == nullptr)) {
+        LLAMA_LOG_ERROR("%s: K type %s has no CPU to_float\n", __func__, ggml_type_name(k->type));
+        return -1;
+    }
+    const int R = q_probe_rows, H = q_probe_heads, D = q_probe_dim;
+    const int64_t n_embd_k = k->ne[0];
+    const int H_kv = (int) (n_embd_k / D);
+    if (H_kv <= 0 || H % H_kv != 0) {
+        LLAMA_LOG_ERROR("%s: head layout mismatch (n_embd_k %lld, D %d, H %d)\n", __func__, (long long) n_embd_k, D, H);
+        return -1;
+    }
+    const int gqa = H / H_kv;
+    const float scale = model.hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf((float) D) : model.hparams.f_attention_scale;
+    const size_t row_bytes = k->nb[1];
+    std::vector<uint8_t> kraw((size_t) n_cells * row_bytes);
+    ggml_backend_tensor_get(k, kraw.data(), 0, kraw.size());
+
+    const int n_thr = std::max(1, (int) std::min<unsigned>(32, std::thread::hardware_concurrency()));
+    const int RH = R*H;
+    auto dequant_row = [&](int64_t c, float * dst) {
+        const uint8_t * src = kraw.data() + (size_t) c*row_bytes;
+        if (k->type == GGML_TYPE_F32) {
+            memcpy(dst, src, (size_t) n_embd_k*sizeof(float));
+        } else {
+            tt->to_float(src, dst, n_embd_k);
+        }
+    };
+    auto logits_of = [&](const float * krow, float * l) {
+        for (int r = 0; r < R; ++r) {
+            for (int h = 0; h < H; ++h) {
+                const float * q  = q_probe.data() + ((size_t) r*H + h)*D;
+                const float * kk = krow + (size_t) (h / gqa)*D;
+                float acc = 0.0f;
+                for (int d = 0; d < D; ++d) {
+                    acc += q[d]*kk[d];
+                }
+                l[r*H + h] = acc*scale;
+            }
+        }
+    };
+    // pass 1: online max / sum per (row, head), per thread, merged
+    std::vector<float> m_t((size_t) n_thr*RH, -INFINITY), s_t((size_t) n_thr*RH, 0.0f);
+    auto pass1 = [&](int t) {
+        std::vector<float> krow(n_embd_k), l(RH);
+        float * m = m_t.data() + (size_t) t*RH;
+        float * s = s_t.data() + (size_t) t*RH;
+        for (int64_t c = t; c < n_cells; c += n_thr) {
+            dequant_row(c, krow.data());
+            logits_of(krow.data(), l.data());
+            for (int i = 0; i < RH; ++i) {
+                if (l[i] > m[i]) {
+                    s[i] = s[i]*expf(m[i] - l[i]) + 1.0f;
+                    m[i] = l[i];
+                } else {
+                    s[i] += expf(l[i] - m[i]);
+                }
+            }
+        }
+    };
+    {
+        std::vector<std::thread> th;
+        for (int t = 0; t < n_thr; ++t) {
+            th.emplace_back(pass1, t);
+        }
+        for (auto & x : th) {
+            x.join();
+        }
+    }
+    std::vector<float> M(RH, -INFINITY), S(RH, 0.0f);
+    for (int t = 0; t < n_thr; ++t) {
+        for (int i = 0; i < RH; ++i) {
+            const float mt = m_t[(size_t) t*RH + i], st = s_t[(size_t) t*RH + i];
+            if (st == 0.0f) {
+                continue;
+            }
+            const float mn = std::max(M[i], mt);
+            S[i] = S[i]*expf(M[i] - mn) + st*expf(mt - mn);
+            M[i] = mn;
+        }
+    }
+    // pass 2: weights summed over rows and heads
+    auto pass2 = [&](int t) {
+        std::vector<float> krow(n_embd_k), l(RH);
+        for (int64_t c = t; c < n_cells; c += n_thr) {
+            dequant_row(c, krow.data());
+            logits_of(krow.data(), l.data());
+            float acc = 0.0f;
+            for (int i = 0; i < RH; ++i) {
+                acc += expf(l[i] - M[i])/S[i];
+            }
+            out[c] = acc;
+        }
+    };
+    {
+        std::vector<std::thread> th;
+        for (int t = 0; t < n_thr; ++t) {
+            th.emplace_back(pass2, t);
+        }
+        for (auto & x : th) {
+            x.join();
+        }
+    }
+    return 0;
+}
+
 void llama_context::set_capture_layers(const std::vector<int32_t> & layer_ids) {
     const int32_t n_layer = (int32_t) model.hparams.n_layer();
     if (layer_ids.size() > LLAMA_MAX_LAYERS) {
@@ -2118,6 +2259,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT((n_outputs_prev + n_outputs) * (int64_t) row <= (int64_t) embd_capture.size);
             ggml_backend_tensor_get_async(backend_c, t_cap, embd_capture_out, 0,
                                           (size_t) n_outputs * row * sizeof(float));
+        }
+
+        // fast read (T4): the probe layer's Q rows of this ubatch (the last ubatch's rows are the ones used)
+        if (cparams.fr_probe_rows > 0) {
+            ggml_tensor * t_q = res->get_q_probe();
+            if (t_q != nullptr) {
+                ggml_backend_t backend_q = ggml_backend_sched_get_tensor_backend(sched.get(), t_q);
+                GGML_ASSERT(backend_q != nullptr);
+                q_probe_dim   = (int32_t) t_q->ne[0];
+                q_probe_heads = (int32_t) t_q->ne[1];
+                q_probe_rows  = (int32_t) t_q->ne[2];
+                q_probe.resize((size_t) ggml_nelements(t_q));
+                ggml_backend_tensor_get_async(backend_q, t_q, q_probe.data(), 0, ggml_nbytes(t_q));
+            }
         }
 
         // extract logits
@@ -4111,6 +4266,14 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 }
 
 // multi-layer hidden-state tap C API (staging) -------------------------------
+
+void llama_set_fast_read(llama_context * ctx, int32_t layer_limit, int32_t probe_layer, int32_t probe_rows) {
+    ctx->set_fast_read(layer_limit, probe_layer, probe_rows);
+}
+
+int32_t llama_fast_read_scores(llama_context * ctx, int32_t il, int32_t n_cells, float * out) {
+    return ctx->fast_read_scores(il, n_cells, out);
+}
 
 void llama_set_capture_layers(llama_context * ctx, const int32_t * layer_ids, size_t n_layers) {
     std::vector<int32_t> ids;

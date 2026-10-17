@@ -150,6 +150,15 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 // arbitrary set of intermediate layers in one concatenated row.
 LLAMA_API void llama_set_capture_layers(struct llama_context * ctx, const int32_t * layer_ids, size_t n_layers);
 
+//
+// fast read (T4, experimental): a scoring pass that runs only the first layer_limit decoder blocks and exports the
+// RoPE'd Q of the last probe_rows rows of each ubatch at full-attention block probe_layer (layer_limit 0: off, the
+// normal graph). After the pass, llama_fast_read_scores gives per KV cell [0, n_cells) the attention weight of those
+// rows at block il, summed over rows and heads (cell c = position c: one sequence from a cleared cache). Returns 0 on
+// success. Implemented for the qwen35 graph.
+LLAMA_API void    llama_set_fast_read(struct llama_context * ctx, int32_t layer_limit, int32_t probe_layer, int32_t probe_rows);
+LLAMA_API int32_t llama_fast_read_scores(struct llama_context * ctx, int32_t il, int32_t n_cells, float * out);
+
 LLAMA_API uint32_t llama_get_n_capture(struct llama_context * ctx);
 
 // mirrors llama_get_embeddings_pre_norm / _ith

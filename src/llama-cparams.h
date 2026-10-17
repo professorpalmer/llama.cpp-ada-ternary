@@ -48,6 +48,12 @@ struct llama_cparams {
     uint32_t                              n_capture_layers   = 0;
     std::array<int32_t, LLAMA_MAX_LAYERS> capture_layer_idx  = {};
 
+    // fast read (T4, experimental; llama_set_fast_read): the graph stops after fr_layer_limit decoder blocks (0: all),
+    // and the full-attention block fr_probe_layer outputs its RoPE'd Q of the last fr_probe_rows rows of each ubatch
+    int32_t fr_layer_limit = 0;
+    int32_t fr_probe_layer = -1;
+    int32_t fr_probe_rows  = 0;
+
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;

@@ -186,6 +186,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
+        // fast read (T4): the scoring pass runs only the first fr_layer_limit blocks (their KV and recurrent state are
+        // written; the output head below then runs on an early hidden state, and its logits are not used)
+        if (cparams.fr_layer_limit > 0 && il >= cparams.fr_layer_limit) {
+            break;
+        }
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -379,6 +384,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
+
+    // fast read (T4): the probe layer exports Q of the ubatch's last rows (the question at the end of the prompt)
+    if (cparams.fr_probe_rows > 0 && il == cparams.fr_probe_layer) {
+        const int64_t rows = std::min<int64_t>(cparams.fr_probe_rows, n_tokens);
+        ggml_tensor * q_last = ggml_view_3d(ctx0, Qcur, Qcur->ne[0], Qcur->ne[1], rows, Qcur->nb[1], Qcur->nb[2],
+            (n_tokens - rows)*Qcur->nb[2]);
+        q_last = ggml_cont(ctx0, q_last);
+        cb(q_last, "q_probe", il);
+        res->t_q_probe = q_last;
+        ggml_build_forward_expand(gf, q_last);
+    }
 
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;

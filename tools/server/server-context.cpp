@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // staging API: llama_set_fast_read / llama_fast_read_scores (T4)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -192,6 +193,53 @@ struct server_batch {
     }
 };
 
+// fast read (T4, experimental, off by default): LLAMA_FAST_READ="keep=M[,min=N][,sinks=S][,window=W][,layers=K][,probe=L]
+// [,rows=R][,block=B]". A text prompt of at least N tokens on a single-slot server is first read by the first K decoder
+// blocks only (layer limit); full-attention block L exports the RoPE'd Q of the prompt's last R rows, and every prompt
+// token gets the attention weight those rows give it at L (summed over rows and heads). The server then keeps the first
+// S tokens, the last W tokens (the question and the template end), and the best-scoring blocks of B tokens up to M
+// tokens in all, in their original order, clears the cache and reads only the kept tokens with the full model (their
+// positions are renumbered from 0). Query-dependent by design: a later question about another part of the input is
+// scored again from the full input.
+struct server_fast_read_cfg {
+    int keep = 0, min_tokens = 32768, sinks = 256, window = 2048, layers = 8, probe = 7, rows = 32, block = 32;
+};
+
+static const server_fast_read_cfg & server_fast_read() {
+    static const server_fast_read_cfg c = [] {
+        server_fast_read_cfg r;
+        const char * e = getenv("LLAMA_FAST_READ");
+        if (e == nullptr) {
+            return r;
+        }
+        std::string s = e;
+        size_t p = 0;
+        while (p < s.size()) {
+            size_t q = s.find(',', p);
+            if (q == std::string::npos) {
+                q = s.size();
+            }
+            const std::string kv = s.substr(p, q - p);
+            const size_t eq = kv.find('=');
+            if (eq != std::string::npos) {
+                const std::string k = kv.substr(0, eq);
+                const int v = atoi(kv.c_str() + eq + 1);
+                if (k == "keep")   { r.keep = v; }
+                if (k == "min")    { r.min_tokens = v; }
+                if (k == "sinks")  { r.sinks = v; }
+                if (k == "window") { r.window = v; }
+                if (k == "layers") { r.layers = v; }
+                if (k == "probe")  { r.probe = v; }
+                if (k == "rows")   { r.rows = v; }
+                if (k == "block")  { r.block = std::max(1, v); }
+            }
+            p = q + 1;
+        }
+        return r;
+    }();
+    return c;
+}
+
 struct server_slot {
     int id;
 
@@ -222,6 +270,7 @@ struct server_slot {
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
     std::unique_ptr<const server_task> task_prev; // used for debugging
+    double t_fast_read_ms = 0.0; // fast read (T4): scoring pass + selection time of the current task
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
@@ -3149,6 +3198,8 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        fast_read_maybe(slot);
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
@@ -3652,6 +3703,103 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
+    // fast read (T4): see server_fast_read() above. Replaces the task's prompt with the kept tokens and leaves the
+    // cache empty, so the normal path below reads them from position 0.
+    void fast_read_maybe(server_slot & slot) {
+        const server_fast_read_cfg & cfg = server_fast_read();
+        slot.t_fast_read_ms = 0.0;
+        if (cfg.keep <= 0 || params_base.n_parallel != 1 || slot.task->tokens.has_mtmd) {
+            return;
+        }
+        const llama_tokens toks = slot.task->tokens.get_text_tokens();
+        const int N = (int) toks.size();
+        const int keep_total = cfg.keep + cfg.sinks + cfg.window;
+        if (N < cfg.min_tokens || N <= keep_total || (int) toks.size() != slot.task->n_tokens()) {
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        llama_memory_clear(mem, true);
+        slot.prompt.clear();
+
+        // scoring pass: the first `layers` blocks over all N tokens; the last decode holds the last `rows` tokens, so
+        // the probe rows are the end of the prompt
+        llama_set_fast_read(ctx_tgt, cfg.layers, cfg.probe, cfg.rows);
+        const int n_batch = llama_n_batch(ctx_tgt);
+        llama_batch b = llama_batch_init(n_batch, 0, 1);
+        const int tail = std::min(N, std::max(cfg.rows, 1));
+        bool ok = true;
+        auto run = [&](int i0, int i1) {
+            for (int i = i0; i < i1 && ok; i += n_batch) {
+                const int n = std::min(n_batch, i1 - i);
+                common_batch_clear(b);
+                for (int j = 0; j < n; ++j) {
+                    common_batch_add(b, toks[i + j], i + j, { slot.id }, i + j == N - 1);
+                }
+                if (llama_decode(ctx_tgt, b) != 0) {
+                    ok = false;
+                }
+            }
+        };
+        run(0, N - tail);
+        run(N - tail, N);
+        llama_batch_free(b);
+        const int64_t t1 = ggml_time_us();
+
+        std::vector<float> score(N, 0.0f);
+        if (ok) {
+            ok = llama_fast_read_scores(ctx_tgt, cfg.probe, N, score.data()) == 0;
+        }
+        llama_set_fast_read(ctx_tgt, 0, -1, 0);
+        llama_memory_clear(mem, true);
+        const int64_t t2 = ggml_time_us();
+        if (!ok) {
+            SLT_WRN(slot, "fast read: the scoring pass failed; the full prompt is read (%d tokens)\n", N);
+            return;
+        }
+
+        // selection: sinks + window always; the middle in blocks of `block` tokens by summed score, best first
+        std::vector<char> kept(N, 0);
+        const int s_end = std::min(cfg.sinks, N);
+        const int w_beg = std::max(s_end, N - cfg.window);
+        for (int i = 0; i < s_end; ++i) { kept[i] = 1; }
+        for (int i = w_beg; i < N; ++i) { kept[i] = 1; }
+        std::vector<std::pair<float, int>> blocks;
+        for (int i = s_end; i < w_beg; i += cfg.block) {
+            float sum = 0.0f;
+            for (int j = i; j < std::min(i + cfg.block, w_beg); ++j) {
+                sum += score[j];
+            }
+            blocks.push_back({ sum, i });
+        }
+        std::sort(blocks.begin(), blocks.end(), [](const std::pair<float, int> & x, const std::pair<float, int> & y) {
+            return x.first > y.first || (x.first == y.first && x.second < y.second);
+        });
+        int n_mid = 0;
+        for (const auto & bl : blocks) {
+            if (n_mid >= cfg.keep) {
+                break;
+            }
+            for (int j = bl.second; j < std::min(bl.second + cfg.block, w_beg); ++j) {
+                kept[j] = 1;
+                ++n_mid;
+            }
+        }
+        llama_tokens out;
+        out.reserve(cfg.keep + cfg.sinks + cfg.window + cfg.block);
+        for (int i = 0; i < N; ++i) {
+            if (kept[i]) {
+                out.push_back(toks[i]);
+            }
+        }
+        // the task is owned by this slot; this experimental path swaps its prompt for the kept tokens
+        const_cast<server_task *>(slot.task.get())->tokens = server_tokens(out, false);
+        slot.t_fast_read_ms = (ggml_time_us() - t0) / 1000.0;
+        SLT_WRN(slot, "fast read: %d -> %d tokens (sinks %d, window %d, %d blocks of %d), scoring pass %.1f s (%d blocks), "
+            "scores %.1f s\n", N, (int) out.size(), s_end, N - w_beg, (int) ((n_mid + cfg.block - 1)/cfg.block), cfg.block,
+            (t1 - t0)/1e6, cfg.layers, (t2 - t1)/1e6);
+    }
+
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 

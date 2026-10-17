@@ -957,6 +957,10 @@ struct llm_graph_params {
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
             return false;
         }
+        if (cparams.fr_layer_limit != other.cparams.fr_layer_limit || cparams.fr_probe_layer != other.cparams.fr_probe_layer ||
+            cparams.fr_probe_rows != other.cparams.fr_probe_rows) {
+            return false;
+        }
 
         return
             cparams.embeddings              == other.cparams.embeddings              &&
@@ -995,6 +999,9 @@ public:
     // into a single [n_capture * n_embd, n_outputs] tensor, in capture order.
     ggml_tensor * get_h_capture() const { return t_h_capture; }
 
+    // fast read (T4): [head_dim, n_head, rows] RoPE'd Q of the probe layer, last rows of the ubatch
+    ggml_tensor * get_q_probe() const { return t_q_probe; }
+
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
@@ -1030,6 +1037,7 @@ public:
     // by the per-model graph builder when cparams.n_capture_layers > 0.
     ggml_tensor * t_h_capture   = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_q_probe     = nullptr; // fast read (T4): probe-layer Q rows
 
     std::vector<ggml_tensor *> t_layer_inp;
 
