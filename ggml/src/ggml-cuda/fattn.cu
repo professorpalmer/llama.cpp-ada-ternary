@@ -1490,6 +1490,23 @@ bool ggml_cuda_flash_attn_ext_chunked(const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst) == BEST_FATTN_KERNEL_MMA_F16;
 }
 
+// any[ic] = 1 if some row of the packed mask keeps a cell of chunk ic
+static __global__ void fa_chunk_any(const uint32_t * __restrict__ mask, int * __restrict__ any, const int64_t n_words,
+        const int64_t rows, const int64_t row_stride, const int64_t words_per_chunk) {
+    const int64_t w0 = (int64_t) blockIdx.x*words_per_chunk;
+    const int64_t nw = min(w0 + words_per_chunk, n_words) - w0;
+    int found = 0;
+    for (int64_t t = threadIdx.x; t < rows*nw; t += blockDim.x) {
+        if (mask[(t / nw)*row_stride + w0 + t % nw]) {
+            found = 1;
+            break;
+        }
+    }
+    if (__syncthreads_or(found) && threadIdx.x == 0) {
+        any[blockIdx.x] = 1;
+    }
+}
+
 static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -1517,7 +1534,32 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
     const to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
     const size_t ts = ggml_type_size(K->type);
 
-    for (int64_t ic = 0; ic < n_chunks; ++ic) {
+    // a chunk that no row keeps adds nothing to the softmax: skip it (exact; GGML_CUDA_FA_CHUNK_SKIP=0: off)
+    static const bool skip_on = [] { const char * e = getenv("GGML_CUDA_FA_CHUNK_SKIP"); return !e || atoi(e) != 0; }();
+    std::vector<int64_t> todo;
+    if (skip_on && mask && mask->type == GGML_TYPE_I32 && n_chunks > 1) {
+        ggml_cuda_pool_alloc<int> any(pool, n_chunks);
+        CUDA_CHECK(cudaMemsetAsync(any.get(), 0, n_chunks*sizeof(int), stream));
+        const int64_t rows = mask->ne[1]*mask->ne[2]*mask->ne[3];
+        fa_chunk_any<<<(unsigned) n_chunks, 256, 0, stream>>>((const uint32_t *) mask->data, any.get(), mask->ne[0], rows,
+            (int64_t) (mask->nb[1]/sizeof(uint32_t)), C/32);
+        std::vector<int> h(n_chunks);
+        CUDA_CHECK(cudaMemcpyAsync(h.data(), any.get(), n_chunks*sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int64_t ic = 0; ic < n_chunks; ++ic) {
+            if (h[ic]) {
+                todo.push_back(ic);
+            }
+        }
+    }
+    if (todo.empty()) {
+        for (int64_t ic = 0; ic < n_chunks; ++ic) {
+            todo.push_back(ic);
+        }
+    }
+
+    for (size_t it = 0; it < todo.size(); ++it) {
+        const int64_t ic  = todo[it];
         const int64_t kv0 = ic*C;
         const int64_t n   = std::min(C, n_kv - kv0);
 
@@ -1581,7 +1623,7 @@ static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggm
         dst_c.src[2] = &V_h;
         dst_c.src[3] = mask ? &mask_c : nullptr;
 
-        const ggml_cuda_fattn_chunk state = { (float *) dst->data, meta.get(), ic == 0, ic == n_chunks - 1 };
+        const ggml_cuda_fattn_chunk state = { (float *) dst->data, meta.get(), it == 0, it == todo.size() - 1 };
         ctx.fattn_chunk = &state;
         ggml_cuda_flash_attn_ext_mma_f16(ctx, &dst_c);
         ctx.fattn_chunk = nullptr;
