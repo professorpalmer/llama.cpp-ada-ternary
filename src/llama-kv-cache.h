@@ -8,6 +8,11 @@
 #include <unordered_map>
 #include <vector>
 
+// prefill window (T5): layer il keeps the dense mask (LLAMA_PREFILL_WINDOW dense=il:il:...); suppress: the next masks are dense
+bool llama_prefill_window_dense_layer(int il);
+bool llama_prefill_window_has_dense();
+void llama_prefill_window_suppress(bool on);
+
 struct llama_cparams;
 struct llama_hparams;
 struct llama_model;

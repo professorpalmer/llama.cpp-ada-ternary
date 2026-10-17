@@ -552,6 +552,12 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
 
+    if (self_kq_mask_dense && self_kq_mask_dense->buffer) {
+        llama_prefill_window_suppress(true);
+        mctx->set_input_kq_mask(self_kq_mask_dense, ubatch, cparams.causal_attn);
+        llama_prefill_window_suppress(false);
+    }
+
     if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -572,6 +578,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    if (self_kq_mask_dense) {
+        res &= can_reuse_kq_mask(self_kq_mask_dense, mctx, params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -2879,6 +2888,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        if (llama_prefill_window_has_dense()) {
+            inp->self_kq_mask_dense = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2942,7 +2955,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->self_kq_mask_dense && llama_prefill_window_dense_layer(il) ? inp->self_kq_mask_dense : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);

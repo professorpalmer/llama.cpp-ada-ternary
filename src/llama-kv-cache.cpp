@@ -1759,6 +1759,7 @@ struct llama_prefill_window_cfg {
     int32_t window = 0;
     int32_t sink   = 1024;
     int32_t tail   = 1024;
+    std::vector<int> dense; // layers that keep the dense mask
 };
 
 static const llama_prefill_window_cfg & prefill_window_cfg() {
@@ -1783,16 +1784,46 @@ static const llama_prefill_window_cfg & prefill_window_cfg() {
                 if (k == "window") { c.window = v; }
                 if (k == "sink")   { c.sink   = v; }
                 if (k == "tail")   { c.tail   = v; }
+                if (k == "dense") {
+                    const std::string ls = kv.substr(eq + 1);
+                    size_t a = 0;
+                    while (a < ls.size()) {
+                        size_t b = ls.find(':', a);
+                        if (b == std::string::npos) {
+                            b = ls.size();
+                        }
+                        if (b > a) {
+                            c.dense.push_back(atoi(ls.substr(a, b - a).c_str()));
+                        }
+                        a = b + 1;
+                    }
+                }
             }
             i = j + 1;
         }
-        LLAMA_LOG_WARN("%s: prefill window on (experimental): window %d, sink %d, tail %d\n", __func__, c.window, c.sink, c.tail);
+        LLAMA_LOG_WARN("%s: prefill window on (experimental): window %d, sink %d, tail %d, dense layers %zu\n", __func__,
+            c.window, c.sink, c.tail, c.dense.size());
         return c;
     }();
     return cfg;
 }
 
 static std::atomic<int32_t> g_prefill_dense_from{0};
+static thread_local bool    g_prefill_suppress = false;
+
+bool llama_prefill_window_dense_layer(int il) {
+    const auto & d = prefill_window_cfg().dense;
+    return std::find(d.begin(), d.end(), il) != d.end();
+}
+
+bool llama_prefill_window_has_dense() {
+    const auto & c = prefill_window_cfg();
+    return c.window > 0 && !c.dense.empty();
+}
+
+void llama_prefill_window_suppress(bool on) {
+    g_prefill_suppress = on;
+}
 
 void llama_set_prefill_dense_from(int32_t n_prompt) {
     const auto & c = prefill_window_cfg();
@@ -1809,7 +1840,7 @@ struct prefill_window_state {
 static prefill_window_state prefill_window_for(const llama_ubatch * ubatch) {
     const auto & c = prefill_window_cfg();
     prefill_window_state st;
-    if (c.window <= 0) {
+    if (c.window <= 0 || g_prefill_suppress) {
         return st;
     }
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
