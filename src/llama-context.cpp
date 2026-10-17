@@ -1465,20 +1465,25 @@ int32_t llama_context::fast_read_scores(int32_t il, int32_t n_cells, float * out
     if (dump) {
         per_head.assign((size_t) (dump_rows ? RH : H)*n_cells, 0.0f);
     }
+    // LLAMA_FAST_READ_HEADMAX=1: a cell's score is the max over heads of its weight summed over rows, not the sum over
+    // rows and heads (a few heads retrieve; the sum over 24 heads dilutes them)
+    static const bool headmax = [] { const char * e = getenv("LLAMA_FAST_READ_HEADMAX"); return e && atoi(e) != 0; }();
     auto pass2 = [&](int t) {
-        std::vector<float> krow(n_embd_k), l(RH);
+        std::vector<float> krow(n_embd_k), l(RH), hs(H);
         for (int64_t c = t; c < n_cells; c += n_thr) {
             dequant_row(c, krow.data());
             logits_of(krow.data(), l.data());
             float acc = 0.0f;
+            std::fill(hs.begin(), hs.end(), 0.0f);
             for (int i = 0; i < RH; ++i) {
                 const float w = expf(l[i] - M[i])/S[i];
                 acc += w;
+                hs[i % H] += w;
                 if (dump) {
                     per_head[(size_t) (dump_rows ? i : i % H)*n_cells + c] += w;
                 }
             }
-            out[c] = acc;
+            out[c] = headmax ? *std::max_element(hs.begin(), hs.end()) : acc;
         }
     };
     {

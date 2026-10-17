@@ -203,7 +203,9 @@ struct server_batch {
 // scored again from the full input.
 struct server_fast_read_cfg {
     int keep = 0, min_tokens = 32768, sinks = 256, window = 2048, layers = 8, probe = 7, rows = 32, block = 32;
-    int bmax = 0;   // 1: a block's score is its best token, not the sum (diagnostics 10-17: keeps the asked fact more often)
+    int bmax = 0;
+    int qrows = 0;  // 1: the probe rows are the last `rows` tokens of the last user message (before its <|im_end|>), not the
+                    // end of the prompt (the chat template's assistant / think tags); the scoring pass stops there   // 1: a block's score is its best token, not the sum (diagnostics 10-17: keeps the asked fact more often)
 };
 
 static const server_fast_read_cfg & server_fast_read() {
@@ -234,6 +236,7 @@ static const server_fast_read_cfg & server_fast_read() {
                 if (k == "rows")   { r.rows = v; }
                 if (k == "block")  { r.block = std::max(1, v); }
                 if (k == "bmax")   { r.bmax = v; }
+                if (k == "qrows")  { r.qrows = v; }
             }
             p = q + 1;
         }
@@ -3726,31 +3729,45 @@ private:
 
         // scoring pass: the first `layers` blocks over all N tokens; the last decode holds the last `rows` tokens, so
         // the probe rows are the end of the prompt
+        // qrows: the scoring pass ends at the last <|im_end|> (the end of the last user message), so its last rows are
+        // the question's own tokens; the template tail after it is inside the always-kept window
+        int n_score = N;
+        if (cfg.qrows) {
+            for (int i = N - 1; i >= std::max(0, N - 4096); --i) {
+                if (common_token_to_piece(ctx_tgt, toks[i], true) == "<|im_end|>") {
+                    n_score = i;
+                    break;
+                }
+            }
+            if (n_score <= cfg.rows || N - n_score > cfg.window) {
+                n_score = N;
+            }
+        }
         llama_set_fast_read(ctx_tgt, cfg.layers, cfg.probe, cfg.rows);
         const int n_batch = llama_n_batch(ctx_tgt);
         llama_batch b = llama_batch_init(n_batch, 0, 1);
-        const int tail = std::min(N, std::max(cfg.rows, 1));
+        const int tail = std::min(n_score, std::max(cfg.rows, 1));
         bool ok = true;
         auto run = [&](int i0, int i1) {
             for (int i = i0; i < i1 && ok; i += n_batch) {
                 const int n = std::min(n_batch, i1 - i);
                 common_batch_clear(b);
                 for (int j = 0; j < n; ++j) {
-                    common_batch_add(b, toks[i + j], i + j, { slot.id }, i + j == N - 1);
+                    common_batch_add(b, toks[i + j], i + j, { slot.id }, i + j == n_score - 1);
                 }
                 if (llama_decode(ctx_tgt, b) != 0) {
                     ok = false;
                 }
             }
         };
-        run(0, N - tail);
-        run(N - tail, N);
+        run(0, n_score - tail);
+        run(n_score - tail, n_score);
         llama_batch_free(b);
         const int64_t t1 = ggml_time_us();
 
         std::vector<float> score(N, 0.0f);
         if (ok) {
-            ok = llama_fast_read_scores(ctx_tgt, cfg.probe, N, score.data()) == 0;
+            ok = llama_fast_read_scores(ctx_tgt, cfg.probe, n_score, score.data()) == 0;
         }
         if (const char * dump = getenv("LLAMA_FAST_READ_DUMP")) {   // diagnostics: the prompt tokens and the summed scores
             if (FILE * f = fopen((std::string(dump) + ".tok.i32").c_str(), "wb")) {
