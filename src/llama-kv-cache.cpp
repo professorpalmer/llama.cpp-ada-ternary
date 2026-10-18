@@ -1755,10 +1755,12 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 
 // prefill window (T5, experimental, quality emulation): LLAMA_PREFILL_WINDOW="window=W[,sink=S][,tail=T]"
 // a ubatch that ends before the dense tail (n_prompt - T, set by the server) masks cells with S <= pos < p - W; tail and decode stay dense
+// stride=N (P190, 0 = off): every N-th 256-position block of the far part stays visible (a sparse sample of the far context)
 struct llama_prefill_window_cfg {
     int32_t window = 0;
     int32_t sink   = 1024;
     int32_t tail   = 1024;
+    int32_t stride = 0;
     std::vector<int> dense; // layers that keep the dense mask
 };
 
@@ -1784,6 +1786,7 @@ static const llama_prefill_window_cfg & prefill_window_cfg() {
                 if (k == "window") { c.window = v; }
                 if (k == "sink")   { c.sink   = v; }
                 if (k == "tail")   { c.tail   = v; }
+                if (k == "stride") { c.stride = std::max(0, v); }
                 if (k == "dense") {
                     const std::string ls = kv.substr(eq + 1);
                     size_t a = 0;
@@ -1801,8 +1804,8 @@ static const llama_prefill_window_cfg & prefill_window_cfg() {
             }
             i = j + 1;
         }
-        LLAMA_LOG_WARN("%s: prefill window on (experimental): window %d, sink %d, tail %d, dense layers %zu\n", __func__,
-            c.window, c.sink, c.tail, c.dense.size());
+        LLAMA_LOG_WARN("%s: prefill window on (experimental): window %d, sink %d, tail %d, stride %d, dense layers %zu\n", __func__,
+            c.window, c.sink, c.tail, c.stride, c.dense.size());
         return c;
     }();
     return cfg;
@@ -1834,6 +1837,7 @@ struct prefill_window_state {
     bool    on   = false;
     int32_t w    = 0;
     int32_t sink = 0;
+    int32_t stride = 0;
     int32_t pmax = -1;
 };
 
@@ -1849,6 +1853,7 @@ static prefill_window_state prefill_window_for(const llama_ubatch * ubatch) {
     st.on   = st.pmax < g_prefill_dense_from.load();
     st.w    = c.window;
     st.sink = c.sink;
+    st.stride = c.stride;
     return st;
 }
 
@@ -2006,7 +2011,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     }
                 }
 
-                if (pw.on && p0 >= pw.sink && p0 + pw.w < p1) {
+                if (pw.on && p0 >= pw.sink && p0 + pw.w < p1 && !(pw.stride > 0 && (p0 >> 8) % pw.stride == 0)) {
                     goto skip;
                 }
 
@@ -2171,7 +2176,7 @@ static void set_input_kq_mask_packed_impl(const args_set_input_kq_mask & args, u
                         }
                     }
 
-                    if (keep && pw.on && p0 >= pw.sink && p0 + pw.w < p1) {
+                    if (keep && pw.on && p0 >= pw.sink && p0 + pw.w < p1 && !(pw.stride > 0 && (p0 >> 8) % pw.stride == 0)) {
                         keep = false;
                     }
                 }
