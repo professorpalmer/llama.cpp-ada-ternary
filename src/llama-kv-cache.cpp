@@ -1756,11 +1756,13 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 // prefill window (T5, experimental, quality emulation): LLAMA_PREFILL_WINDOW="window=W[,sink=S][,tail=T]"
 // a ubatch that ends before the dense tail (n_prompt - T, set by the server) masks cells with S <= pos < p - W; tail and decode stay dense
 // stride=N (P190, 0 = off): every N-th 256-position block of the far part stays visible (a sparse sample of the far context)
+// bias=1 (P191, f16 mask only): those far blocks get a +log(N) mask bias, so each stands for the N blocks it samples
 struct llama_prefill_window_cfg {
     int32_t window = 0;
     int32_t sink   = 1024;
     int32_t tail   = 1024;
     int32_t stride = 0;
+    int32_t bias   = 0;
     std::vector<int> dense; // layers that keep the dense mask
 };
 
@@ -1787,6 +1789,7 @@ static const llama_prefill_window_cfg & prefill_window_cfg() {
                 if (k == "sink")   { c.sink   = v; }
                 if (k == "tail")   { c.tail   = v; }
                 if (k == "stride") { c.stride = std::max(0, v); }
+                if (k == "bias")   { c.bias   = v; }
                 if (k == "dense") {
                     const std::string ls = kv.substr(eq + 1);
                     size_t a = 0;
@@ -1804,8 +1807,8 @@ static const llama_prefill_window_cfg & prefill_window_cfg() {
             }
             i = j + 1;
         }
-        LLAMA_LOG_WARN("%s: prefill window on (experimental): window %d, sink %d, tail %d, stride %d, dense layers %zu\n", __func__,
-            c.window, c.sink, c.tail, c.stride, c.dense.size());
+        LLAMA_LOG_WARN("%s: prefill window on (experimental): window %d, sink %d, tail %d, stride %d, bias %d, dense layers %zu\n", __func__,
+            c.window, c.sink, c.tail, c.stride, c.bias, c.dense.size());
         return c;
     }();
     return cfg;
@@ -1838,6 +1841,7 @@ struct prefill_window_state {
     int32_t w    = 0;
     int32_t sink = 0;
     int32_t stride = 0;
+    float   bias   = 0.0f; // mask value of a sampled far cell (f16 mask)
     int32_t pmax = -1;
 };
 
@@ -1854,6 +1858,7 @@ static prefill_window_state prefill_window_for(const llama_ubatch * ubatch) {
     st.w    = c.window;
     st.sink = c.sink;
     st.stride = c.stride;
+    st.bias   = c.bias && c.stride > 1 ? logf((float) c.stride) : 0.0f;
     return st;
 }
 
@@ -2017,6 +2022,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 if (alibi) {
                     data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
+                } else if (pw.bias != 0.0f && pw.on && p0 >= pw.sink && p0 + pw.w < p1) { // a sampled far cell (no goto above)
+                    data[idst + j] = llama_cast<T>(pw.bias);
                 } else {
                     data[idst + j] = mask_keep;
                 }
