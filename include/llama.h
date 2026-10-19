@@ -434,6 +434,12 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // [EXPERIMENTAL] draft-only vocabulary shortlist for an MTP draft context: path to a llama-mtp-vocab-v1 file
+        // (header "llama-mtp-vocab-v1 <n_vocab> <count>", then <count> token ids). The context keeps a compact copy of
+        // those rows of the output head, so a draft step reads <count> rows instead of n_vocab; a backend sampler maps
+        // its picks back to token ids. nullptr = the full vocabulary. Design from zgsndzq/llama.cpp-qwen38-flash (MIT).
+        const char * draft_vocab_map;
     };
 
     struct llama_model_tensor_override {

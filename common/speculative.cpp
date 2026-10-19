@@ -3518,6 +3518,9 @@ common_speculative_init_result::common_speculative_init_result(
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
 
+        if (!params.speculative.draft.vocab_map.empty()) {
+            cparams.draft_vocab_map = params.speculative.draft.vocab_map.c_str(); // read while the context is made
+        }
         llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);

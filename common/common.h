@@ -352,6 +352,10 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // MTP draft only: a llama-mtp-vocab-v1 shortlist; a draft step scores these rows of the output head, the target
+    // verifies with the full vocabulary (--spec-draft-vocab-map; empty = the full vocabulary)
+    std::string vocab_map;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

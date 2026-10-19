@@ -1364,6 +1364,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_logits_ids  = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -1541,6 +1542,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     dspark_ctx_width(params.dspark_ctx_width),
     hadamard_rotations(params.hadamard_rotations),
     hadamard_inverses(params.hadamard_inverses),
+    draft_vocab_ids(params.draft_vocab_ids),
+    draft_vocab_head(params.draft_vocab_head),
     samplers(params.samplers),
     cb_func(params.cb),
     res(params.res),
@@ -1563,10 +1566,9 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
-ggml_tensor * llm_graph_context::build_lora_mm(
+ggml_tensor * llm_graph_context::build_hadamard_fold(
           ggml_tensor * w,
-          ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * cur) const {
     ggml_tensor * cur_mm = cur;
     if (hadamard_rotations) {
         const auto it = hadamard_rotations->find(w);
@@ -1594,6 +1596,57 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             }
         }
     }
+    return cur_mm;
+}
+
+ggml_tensor * llm_graph_context::build_draft_vocab_logits(
+          ggml_tensor * head_w,
+          ggml_tensor * head_s,
+          ggml_tensor * cur) const {
+    // Draft-only vocabulary shortlist (design from zgsndzq/llama.cpp-qwen38-flash, MIT). The context holds a compact
+    // copy of the shortlisted rows in the head's own format, so this one matmul reads n_sel of n_vocab rows. A gather of
+    // the rows per step (ggml_get_rows returns F32) reads more than the full head, so there is no such fallback: without
+    // the compact copy the caller keeps the full head.
+    if (draft_vocab_ids == nullptr || draft_vocab_head == nullptr || head_w == nullptr || n_outputs == 0) {
+        return nullptr;
+    }
+    if ((loras && !loras->empty()) || (head_s && ggml_nelements(head_s) != 1)) {
+        return nullptr; // a per-row scale or an adapter would need the same rows
+    }
+    const int64_t n_sel = draft_vocab_ids->ne[0];
+    if (draft_vocab_head->ne[1] != n_sel || draft_vocab_head->ne[0] != head_w->ne[0] || n_sel >= head_w->ne[1]) {
+        return nullptr;
+    }
+    // the compact logits never reach the host: every output row must be taken by a backend sampler
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.output[i]) {
+            continue;
+        }
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            if (samplers.find(ubatch.seq_id[i][j]) == samplers.end()) {
+                return nullptr;
+            }
+        }
+    }
+    // the rows are a copy of head_w's rows, so the activation takes head_w's Hadamard fold
+    ggml_tensor * cur_rot = build_hadamard_fold(head_w, cur);
+    GGML_ASSERT(cur_rot->ne[0] == draft_vocab_head->ne[0]);
+
+    ggml_tensor * logits = ggml_mul_mat(ctx0, draft_vocab_head, cur_rot); // [n_sel, n_outputs]
+    logits = ggml_reshape_2d(ctx0, logits, n_sel, ggml_nelements(logits) / n_sel);
+    if (head_s) {
+        logits = ggml_mul(ctx0, logits, head_s);
+    }
+    cb(logits, "draft_vocab_logits", -1);
+    res->t_logits_ids = draft_vocab_ids;
+    return logits;
+}
+
+ggml_tensor * llm_graph_context::build_lora_mm(
+          ggml_tensor * w,
+          ggml_tensor * cur,
+          ggml_tensor * w_s) const {
+    ggml_tensor * cur_mm = build_hadamard_fold(w, cur);
 
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
@@ -3977,7 +4030,7 @@ void llm_graph_context::build_sampling() const {
                 /*.logits       =*/ logits_seq,
                 /*.probs        =*/ nullptr,
                 /*.sampled      =*/ nullptr,
-                /*.candidates   =*/ nullptr,
+                /*.candidates   =*/ res->t_logits_ids, // a vocabulary shortlist: row -> token id (nullptr: identity)
             };
 
             assert(sampler->iface->backend_apply);

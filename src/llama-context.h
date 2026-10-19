@@ -402,6 +402,16 @@ private:
     llama_hadamard_rotations hadamard_rotations;
     llama_hadamard_rotations hadamard_inverses;
 
+    // draft-only vocabulary shortlist (llama_context_params::draft_vocab_map): the token ids and a compact copy of
+    // those rows of the output head, on the head's device
+    struct {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor *           ids  = nullptr; // [n_sel] I32
+        ggml_tensor *           head = nullptr; // [n_embd, n_sel], the head's type
+    } draft_vocab;
+    void init_draft_vocab(const char * path);
+
     // one-time Hadamard transform-coverage check on the first built graph
     bool hadamard_verified = false;
 

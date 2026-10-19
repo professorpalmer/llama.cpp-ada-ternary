@@ -14,12 +14,14 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-mtp-vocab.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -249,6 +251,10 @@ llama_context::llama_context(
         const auto & other = cparams.ctx_other->model;
         hadamard_rotations.insert(other.hadamard_rotations.begin(), other.hadamard_rotations.end());
         hadamard_inverses .insert(other.hadamard_inverses .begin(), other.hadamard_inverses .end());
+    }
+
+    if (params.draft_vocab_map != nullptr && params.draft_vocab_map[0] != '\0') {
+        init_draft_vocab(params.draft_vocab_map);
     }
 
     auto rope_scaling_type = params.rope_scaling_type;
@@ -599,6 +605,66 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+}
+
+void llama_context::init_draft_vocab(const char * path) {
+    // Draft-only vocabulary shortlist (design from zgsndzq/llama.cpp-qwen38-flash, MIT; the static map only). A compact
+    // copy of exactly the shortlisted rows, in the head's own format (raw row bytes, so the copy cannot change the
+    // scores of those rows), lets one plain matmul read n_sel of n_vocab rows per draft step.
+    std::ifstream file(path);
+    if (!file) {
+        throw std::runtime_error(format("cannot open draft vocabulary map '%s'", path));
+    }
+    const int64_t n_vocab = model.vocab.n_tokens();
+    llama_mtp_vocab_map map = llama_mtp_vocab_read(file);
+    if (map.n_vocab != n_vocab) {
+        throw std::runtime_error(format("draft vocabulary map '%s' is for a %lld-token vocabulary, the model has %lld",
+                    path, (long long) map.n_vocab, (long long) n_vocab));
+    }
+
+    // the head the MTP layer reads (qwen35: nextn.shared_head_head, else model.output)
+    const ggml_tensor * head = model.output;
+    if (model.hparams.n_layer_nextn > 0 && model.hparams.n_layer() < model.layers.size()) {
+        const auto & nextn = model.layers[model.hparams.n_layer()].nextn;
+        if (nextn.shared_head_head) {
+            head = nextn.shared_head_head;
+        }
+    }
+    if (head == nullptr || head->buffer == nullptr) {
+        throw std::runtime_error("draft vocabulary map: the model has no allocated output head");
+    }
+    const int64_t n_sel  = (int64_t) map.ids.size();
+    const size_t  row_sz = ggml_row_size(head->type, head->ne[0]);
+    if (head->type == GGML_TYPE_F32 || head->ne[2] != 1 || head->ne[3] != 1 || head->ne[0] != model.hparams.n_embd ||
+            head->nb[1] != row_sz || n_sel >= head->ne[1]) {
+        LLAMA_LOG_WARN("%s: draft vocabulary map '%s': head %s [%lld, %lld] has no compact row copy; the draft keeps the full head\n",
+                __func__, path, ggml_type_name(head->type), (long long) head->ne[0], (long long) head->ne[1]);
+        return;
+    }
+
+    ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, true };
+    draft_vocab.ctx.reset(ggml_init(ip));
+    draft_vocab.ids  = ggml_new_tensor_1d(draft_vocab.ctx.get(), GGML_TYPE_I32, n_sel);
+    draft_vocab.head = ggml_new_tensor_2d(draft_vocab.ctx.get(), head->type, head->ne[0], n_sel);
+    ggml_set_name(draft_vocab.ids,  "draft_vocab_ids");
+    ggml_set_name(draft_vocab.head, "draft_vocab_head");
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(head->buffer);
+    draft_vocab.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(draft_vocab.ctx.get(), buft));
+    if (!draft_vocab.buf) {
+        throw std::runtime_error("draft vocabulary map: failed to allocate the shortlist tensors");
+    }
+    ggml_backend_tensor_set(draft_vocab.ids, map.ids.data(), 0, (size_t) n_sel * sizeof(int32_t));
+
+    std::vector<uint8_t> row(row_sz);
+    for (int64_t i = 0; i < n_sel; ++i) {
+        ggml_backend_tensor_get(head, row.data(), (size_t) map.ids[i] * row_sz, row_sz);
+        ggml_backend_tensor_set(draft_vocab.head, row.data(), (size_t) i * row_sz, row_sz);
+    }
+    LLAMA_LOG_INFO("%s: draft vocabulary shortlist: %lld of %lld tokens from '%s'; head %s copy %.1f MiB of %.1f MiB (%.1fx less to read per draft step)\n",
+            __func__, (long long) n_sel, (long long) n_vocab, path, ggml_type_name(head->type),
+            (double) row_sz * n_sel / 1048576.0, (double) ggml_nbytes(head) / 1048576.0,
+            (double) head->ne[1] / (double) n_sel);
 }
 
 llama_context::~llama_context() {
@@ -2757,6 +2823,8 @@ llm_graph_params llama_context::graph_params(
         /*.dspark_ctx_width =*/dspark_ctx.n_embd_cap,
         /*.hadamard_rotations =*/&hadamard_rotations,
         /*.hadamard_inverses  =*/&hadamard_inverses,
+        /*.draft_vocab_ids    =*/draft_vocab.ids,
+        /*.draft_vocab_head   =*/draft_vocab.head,
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
         /*.cb          =*/graph_get_cb(),
@@ -3841,6 +3909,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.draft_vocab_map             =*/ nullptr,
     };
 
     return result;

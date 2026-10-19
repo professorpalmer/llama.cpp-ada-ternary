@@ -869,6 +869,8 @@ struct llm_graph_params {
     int64_t                          dspark_ctx_width;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    ggml_tensor *                    draft_vocab_ids;  // [n_sel] I32 shortlist of an MTP draft context, or nullptr
+    ggml_tensor *                    draft_vocab_head; // [n_embd, n_sel] those rows of the output head, or nullptr
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1030,6 +1032,7 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_logits_ids  = nullptr; // [n_sel] when the t_logits rows are a vocabulary shortlist: row -> token id
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     // [n_capture * n_embd, n_outputs] concatenated multi-layer hidden states, set
@@ -1133,6 +1136,8 @@ struct llm_graph_context {
     int64_t                          dspark_ctx_width;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    ggml_tensor * draft_vocab_ids;  // see llm_graph_params
+    ggml_tensor * draft_vocab_head; // see llm_graph_params
 
     // Transforms shared by folded weights on the same activation. Key is (input, rotation);
     // both must match. Valid for one graph build only.
@@ -1161,6 +1166,13 @@ struct llm_graph_context {
                      int   il) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
+    // MTP draft head logits over the context's vocabulary shortlist (llama_context_params::draft_vocab_map): one
+    // matmul against the compact head copy; nullptr = use the full head
+    ggml_tensor * build_draft_vocab_logits(ggml_tensor * head_w, ggml_tensor * head_s, ggml_tensor * cur) const;
+
+    // the Hadamard fold of w's input (prism.hadamard), the same transform build_lora_mm applies
+    ggml_tensor * build_hadamard_fold(ggml_tensor * w, ggml_tensor * cur) const;
+
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,

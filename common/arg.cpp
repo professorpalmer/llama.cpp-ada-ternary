@@ -4248,6 +4248,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-draft-vocab-map"}, "FNAME",
+        "MTP draft only: a vocabulary shortlist (llama-mtp-vocab-v1 file); a draft step scores only those rows of the "
+        "output head, the target verifies with the full vocabulary. Needs draft backend sampling (default: the full vocabulary)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.vocab_map = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_MAP"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"
         "use --list-devices to see a list of available devices",
