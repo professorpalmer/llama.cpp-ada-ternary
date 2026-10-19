@@ -378,6 +378,26 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mctx_cur, const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx_cur->get_n_rs();
 
+    // replay rollback: before s_copy(), which consumes the rollback index
+    if (s_copy0 && s_copy0->buffer) {   // unallocated when no layer of this graph reads it
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy0->buffer));
+        int32_t * data = (int32_t *) s_copy0->data;
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            data[i] = mctx_cur->s_copy0(i);
+        }
+    }
+    if (s_pmask && s_pmask->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_pmask->buffer));
+        float * data = (float *) s_pmask->data;
+        const int64_t n_pend = s_pmask->ne[2];
+        for (int64_t s = 0; s < s_pmask->ne[3]; ++s) {
+            const int64_t m = mctx_cur->s_pend_mask(s);   // the last m pending tokens were rejected (or are not its own)
+            for (int64_t t = 0; t < n_pend; ++t) {
+                data[s*n_pend + t] = t >= n_pend - m ? -INFINITY : 0.0f;
+            }
+        }
+    }
+
     if (s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
         int32_t * data = (int32_t *) s_copy->data;
@@ -3581,6 +3601,17 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+
+    if (mctx_cur->get_replay()) {
+        inp->s_copy0 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy0);
+
+        inp->s_copy0_main  = ggml_view_1d(ctx0, inp->s_copy0, n_seqs, 0);
+        inp->s_copy0_extra = ggml_view_1d(ctx0, inp->s_copy0, n_rs - n_seqs, n_seqs * inp->s_copy0->nb[0]);
+
+        inp->s_pmask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, 1, mctx_cur->get_n_pend(), n_seqs);
+        ggml_set_input(inp->s_pmask);
+    }
 
     return inp;
 }
