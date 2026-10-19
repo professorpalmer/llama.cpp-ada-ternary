@@ -4232,6 +4232,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_SPLIT"));
     add_opt(common_arg(
+        {"--spec-draft-adaptive"},
+        "adaptive MTP draft depth: the draft size climbs after runs of fully accepted drafts and drops after misses, "
+        "between --spec-draft-n-min-adaptive and --spec-draft-n-max (default: off, fixed --spec-draft-n-max)",
+        [](common_params & params) {
+            params.speculative.draft.adaptive = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--spec-draft-n-min-adaptive"}, "N",
+        string_format("lowest adaptive MTP draft depth (--spec-draft-adaptive); the depth starts here (default: %d)",
+                      params.speculative.draft.n_min_adaptive),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_min_adaptive = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
+    add_opt(common_arg(
         {"--spec-draft-p-min", "--draft-p-min"}, "P",
         string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.draft.p_min),
         [](common_params & params, const std::string & value) {

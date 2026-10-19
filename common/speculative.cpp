@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "speculative-adaptive.h"
 
 #include "../src/llama-ext.h"
 #include "common.h"
@@ -2133,6 +2134,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // adaptive draft depth (--spec-draft-adaptive, common/speculative-adaptive.h): off = a fixed cap of params.n_max
+    std::vector<common_speculative_adaptive> adaptive_ctrl;   // [n_seq]
+    std::vector<int>                         n_last;          // [n_seq] tokens this drafter gave the last draft() call
+
     // Deferred catch-up (single head, separate draft memory). process() used to run the draft
     // over every row of the target's verify batch right away, only to fill the draft's memory:
     // one extra graph launch per step, spent partly on rows the target then rejects. Instead the
@@ -2189,6 +2194,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
         n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
+
+        n_last.assign(n_seq, 0);
+        if (this->params.adaptive) {
+            adaptive_ctrl.assign(n_seq, common_speculative_adaptive());
+            for (auto & c : adaptive_ctrl) {
+                c.reset(this->params.n_max, this->params.n_min_adaptive);
+            }
+            LOG_INF("%s: adaptive MTP draft depth: %d .. %d\n", __func__,
+                    std::max(1, std::min(this->params.n_min_adaptive, this->params.n_max)), this->params.n_max);
+        }
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
@@ -2689,7 +2704,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 result.push_back(id);
 
                 // the caller's per-draft cap (the server's depth-dependent draft size) as well as the global one
-                if (params.n_max <= (int) result.size() || (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                // (the adaptive depth when it is on)
+                const int cap = adaptive_ctrl.empty() ? params.n_max : adaptive_ctrl[seq_id].n_cur;
+                if (cap <= (int) result.size() || (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2739,12 +2756,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+            n_last[seq_id] = (int) dp.result->size();
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        // the adaptive depth learns only from verifies of this drafter's own drafts
+        if (!is_other && !adaptive_ctrl.empty() && n_last[seq_id] > 0) {
+            const int before = adaptive_ctrl[seq_id].n_cur;
+            adaptive_ctrl[seq_id].update(n_last[seq_id], n_accepted, params.n_max, params.n_min_adaptive);
+            if (adaptive_ctrl[seq_id].n_cur != before) {
+                SPC_DBG("adaptive draft depth seq %d: %d -> %d (drafted %d, accepted %d)\n",
+                        (int) seq_id, before, adaptive_ctrl[seq_id].n_cur, n_last[seq_id], (int) n_accepted);
+            }
+            n_last[seq_id] = 0;
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];

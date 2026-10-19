@@ -352,6 +352,11 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // adaptive MTP draft depth (--spec-draft-adaptive): the depth climbs after runs of fully accepted drafts and drops
+    // after misses, between n_min_adaptive and n_max (common/speculative-adaptive.h)
+    bool    adaptive       = false;
+    int32_t n_min_adaptive = 1;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
