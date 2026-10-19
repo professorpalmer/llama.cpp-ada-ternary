@@ -1,5 +1,6 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include <cstring>
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -272,10 +273,14 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const char * e = getenv("GGML_CUDA_KV_FAKE_BITS");
             return e ? atoi(e) : 0;
         }();
+        // GGML_CUDA_KV_FAKE_V_ONLY=1: only V cache rows get the fake levels (K stays real q4_0)
+        static const bool v_only = [] { const char * e = getenv("GGML_CUDA_KV_FAKE_V_ONLY"); return e && atoi(e) != 0; }();
+        static const int  zero   = 0;
+        const int * want = (v_only && strstr(dst->name, "cache_v") == nullptr) ? &zero : &fake_bits;
         static int fake_bits_set = -1;   // per process; one device is enough for this test
-        if (fake_bits_set != fake_bits) {
-            CUDA_CHECK(cudaMemcpyToSymbol(g_kv_fake_bits, &fake_bits, sizeof(int)));
-            fake_bits_set = fake_bits;
+        if (fake_bits_set != *want) {
+            CUDA_CHECK(cudaMemcpyToSymbolAsync(g_kv_fake_bits, want, sizeof(int), 0, cudaMemcpyHostToDevice, stream));
+            fake_bits_set = *want;
         }
         set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
             src0_d, src1_d, (block_q4_0*)dst->data,
