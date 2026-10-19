@@ -14,7 +14,7 @@ static __device__ __forceinline__ int best_index_int8(int n, const int8_t * val,
     return x - val[mu-1] < val[mu] - x ? mu-1 : mu;
 }
 
-// Test only (GGML_CUDA_KV_FAKE_BITS=3 or 2, set by set-rows.cu): K/V rows written by set_rows keep only 2^b levels of
+// Test only (GGML_CUDA_KV_FAKE_BITS=3, 2 or 20 = 2-bit Lloyd-Max, set by set-rows.cu): K/V rows written by set_rows keep only 2^b levels of
 // the q4_0 grid, to measure what a b-bit KV format would cost in quality. 0 = normal q4_0.
 static __device__ int g_kv_fake_bits = 0;
 
@@ -31,6 +31,25 @@ static __device__ void quantize_f32_q4_0_block(const float * __restrict__ x, blo
     }
 
     const int fake_bits = g_kv_fake_bits;
+    if (fake_bits == 20) {
+        // 2-bit Lloyd-Max levels for a Gaussian block (the KV rotation makes it near Gaussian): +-0.4528 s and +-1.510 s
+        // (s = the block rms), on the q4_0 grid as -7, -2, 2, 7 with d = 1.510 s / 7; the decision edge is 0.9816 s
+        float ss = 0.0f;
+        for (int j = 0; j < QK4_0; ++j) {
+            ss += x[j]*x[j];
+        }
+        const float s = sqrtf(ss / QK4_0);
+        y->d = 1.510f * s / 7.0f;
+        for (int j = 0; j < QK4_0/2; ++j) {
+            const float v0 = x[0 + j], v1 = x[QK4_0/2 + j];
+            const int   m0 = fabsf(v0) < 0.9816f*s ? 2 : 7;
+            const int   m1 = fabsf(v1) < 0.9816f*s ? 2 : 7;
+            const int   q0 = v0 < 0.0f ? 8 - m0 : 8 + m0;
+            const int   q1 = v1 < 0.0f ? 8 - m1 : 8 + m1;
+            y->qs[j] = (uint8_t) (q0 | (q1 << 4));
+        }
+        return;
+    }
     if (fake_bits == 2 || fake_bits == 3) {
         // levels -L/2 .. L/2-1 with step dk; stored as q4_0 index s*k + 8 with d = dk/s (s = 16/L), same values
         const int   half = fake_bits == 3 ? 4 : 2;
