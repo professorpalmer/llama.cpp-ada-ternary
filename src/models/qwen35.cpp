@@ -479,10 +479,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 && !inp->s_pmask;
+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 && !inp->s_pinfo;
 
     ggml_tensor * state;
-    if (inp->s_pmask) {
+    if (inp->s_pinfo) {
         // replay rollback: S has one plane; each seq's row there (s_copy0), never a snapshot plane
         state = build_rs(ssm_states_all, inp->s_copy0_main, inp->s_copy0_extra, hparams.n_embd_s(), n_seqs,
                 mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z());

@@ -112,10 +112,10 @@ public:
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
 
-    // replay rollback (LLAMA_RS_REPLAY=1, qwen35 GDN layers with raw gates): S keeps one plane, and p_l
-    // keeps the GDN inputs of the last n_rs_seq tokens of each cell (row = n_rs_seq tokens of [k | v | gate | beta]).
-    // Each step runs these tokens again in front of the batch; a rejected one has gate = beta = -inf, which makes its
-    // update exactly the identity. The conv state (r_l) keeps its snapshot planes.
+    // replay rollback (LLAMA_RS_REPLAY=1, qwen35 GDN layers with raw gates): S keeps one plane, and p_l keeps the GDN
+    // inputs of the last n_rs_seq tokens of each cell (row = n_rs_seq tokens of [k | v | gate | beta], then the count
+    // of valid ones). The GDN kernel runs the valid ones that were not rejected before the batch
+    // (ggml_gated_delta_net_replay). The conv state (r_l) keeps its snapshot planes.
     bool     replay = false;
     uint32_t pend_k = 0; // k floats per token (ssm_d_state * ssm_n_group)
     uint32_t pend_v = 0; // v floats per token (ssm_d_inner)
@@ -192,8 +192,9 @@ public:
     bool     get_replay() const;
     uint32_t get_n_pend() const;
     int32_t  s_copy0(int i) const;      // the cell's S row (plane 0), without consuming the rollback index
-    uint32_t s_pend_mask(int i) const;  // pending tokens to skip for main row i (all of them for a new cell);
-                                        // call before s_copy(i), which consumes the rollback index
+    // main row i: its pending row (plane 0), the rejected count (the pending rollback), fresh (a new state);
+    // call before s_copy(i), which consumes the rollback index
+    void     s_pend_info(int i, int32_t & row, int32_t & rejected, int32_t & fresh) const;
 
 private:
     const llama_memory_status status;

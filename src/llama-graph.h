@@ -344,7 +344,7 @@ public:
     ggml_tensor * s_copy0       = nullptr; // I32 [n_rs]: S / pending rows (one plane)
     ggml_tensor * s_copy0_main  = nullptr; // I32 [n_seqs]
     ggml_tensor * s_copy0_extra = nullptr; // I32 [n_rs - n_seqs]
-    ggml_tensor * s_pmask       = nullptr; // F32 [1, 1, n_pend, n_seqs]: 0, or -inf for a pending token to skip
+    ggml_tensor * s_pinfo       = nullptr; // I32 [3 * n_seqs]: pending row, rejected count, fresh
 
     // GDN rows mode only (see build_rs_write_rows): I64 [n_write*n_seqs]
     // cache-row indices for the snapshot SET_ROWS scatter; created lazily,

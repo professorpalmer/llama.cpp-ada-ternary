@@ -555,52 +555,21 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     GGML_ASSERT(state_rows == nullptr || keep); // rows mode is a ring-path optimization
 
-    if (inp->s_pmask) {
-        // replay rollback (llama_memory_recurrent::p_l). The GDN inputs of the last P tokens of each cell run again
-        // in front of the batch; a rejected one has raw gate = raw beta = -inf (s_pmask), so beta = 0 and g = 1 and
-        // its update is exactly the identity. The state P tokens before the end (snapshot slot P) goes to the one S
-        // plane, the last P tokens' inputs (rejected ones keep -inf) go back to p_l, and the pending outputs are
-        // dropped. Accepted tokens run through the same kernel with the same inputs as when they were read first.
+    if (inp->s_pinfo) {
+        // replay rollback (llama_memory_recurrent::p_l, ggml_gated_delta_net_replay): the GDN kernel runs this cell's
+        // pending tokens (the inputs of its last P tokens, without the rejected ones) before the batch, writes the
+        // state P tokens before the end to its output (the CUDA cache fusion writes it straight into the S plane:
+        // the first copy below) and the inputs of the last P tokens after it (the second copy, into p_l).
         const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
         GGML_ASSERT(raw && state_rows == nullptr && "replay rollback needs the fused GDN op with raw gates");
 
         const int64_t P     = mctx_cur->get_n_pend();
-        const int64_t S_k   = k->ne[0];
-        const int64_t H_k   = k->ne[1];
-        const int64_t n_kf  = S_k * H_k;
-        const int64_t n_vf  = S_v * H_v;
-        const int64_t p_tok = n_kf + n_vf + 2*H_v;
-        const int64_t T     = P + n_seq_tokens;
         const int64_t D     = S_v * S_v * H_v;
-        const uint32_t n_rs = mctx_cur->get_n_rs();
-        const size_t  f     = sizeof(float);
-
         ggml_tensor * p_all = mctx_cur->get_p_l(il);
-        GGML_ASSERT(p_all && p_all->ne[0] == p_tok * P);
+        GGML_ASSERT(p_all && p_all->ne[0] == P * (k->ne[0] * k->ne[1] + S_v * H_v + 2 * H_v) + 1);
 
-        // read the pending rows first; the extra-row relocation and the write-back below come after
-        ggml_tensor * pend = ggml_get_rows(ctx0, p_all, inp->s_copy0_main); // [p_tok*P, n_seqs]
-        ggml_build_forward_expand(gf, pend);
-        if (n_rs > n_seqs) {
-            ggml_tensor * extra = ggml_get_rows(ctx0, p_all, inp->s_copy0_extra);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, extra,
-                ggml_view_2d(ctx0, p_all, p_all->ne[0], n_rs - n_seqs, p_all->nb[1], (kv_head + n_seqs) * p_all->nb[1])));
-        }
-
-        ggml_tensor * k_p = ggml_view_4d(ctx0, pend, S_k, H_k, P, n_seqs, S_k*f, p_tok*f, pend->nb[1], 0);
-        ggml_tensor * v_p = ggml_view_4d(ctx0, pend, S_v, H_v, P, n_seqs, S_v*f, p_tok*f, pend->nb[1], n_kf*f);
-        ggml_tensor * g_p = ggml_view_4d(ctx0, pend, 1,   H_v, P, n_seqs, f,     p_tok*f, pend->nb[1], (n_kf + n_vf)*f);
-        ggml_tensor * b_p = ggml_view_4d(ctx0, pend, 1,   H_v, P, n_seqs, f,     p_tok*f, pend->nb[1], (n_kf + n_vf + H_v)*f);
-        g_p = ggml_add(ctx0, g_p, inp->s_pmask);
-        b_p = ggml_add(ctx0, b_p, inp->s_pmask);
-
-        ggml_tensor * q_all = ggml_concat(ctx0, k_p, q, 2); // the pending outputs are dropped: any finite q
-        ggml_tensor * k_all = ggml_concat(ctx0, k_p, k, 2);
-        ggml_tensor * v_all = ggml_concat(ctx0, v_p, v, 2);
-        ggml_tensor * g_all = ggml_concat(ctx0, g_p, gdn_raw_alpha, 2);
-        ggml_tensor * b_all = ggml_concat(ctx0, b_p, gdn_raw_beta,  2);
-
-        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q_all, k_all, v_all, g_all, b_all, s, P + 1);
+        ggml_tensor * gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, gdn_raw_alpha, gdn_raw_beta, s, p_all,
+                                                            inp->s_pinfo, (int) P);
         ggml_gated_delta_net_set_raw_gates(gdn_out, gdn_raw_dt_bias, gdn_raw_a);
         res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
 
@@ -608,31 +577,20 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             S_v, H_v, n_seq_tokens, n_seqs,
             ggml_row_size(gdn_out->type, S_v),
             ggml_row_size(gdn_out->type, S_v * H_v),
-            ggml_row_size(gdn_out->type, S_v * H_v * T),
-            ggml_row_size(gdn_out->type, S_v * H_v * P));
-        if (!ggml_is_contiguous(output)) {
-            output = ggml_cont(ctx0, output);
-        }
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
         cb(output, "attn_output", il);
 
-        // snapshot slot P (the state before the last P tokens) -> the S plane
-        const int64_t attn_elems = S_v * H_v * T * n_seqs;
-        ggml_tensor * s_new = ggml_view_2d(ctx0, gdn_out, D, n_seqs, ggml_row_size(gdn_out->type, D),
-            ggml_row_size(gdn_out->type, attn_elems + P * D * n_seqs));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, s_new,
+        const int64_t attn_elems = S_v * H_v * n_seq_tokens * n_seqs;
+        ggml_tensor * s_commit = ggml_view_2d(ctx0, gdn_out, D, n_seqs, ggml_row_size(gdn_out->type, D),
+            ggml_row_size(gdn_out->type, attn_elems));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, s_commit,
             ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1], kv_head * ssm_states_all->nb[1])));
 
-        // the last P tokens' inputs -> p_l (after the read above: each copy depends on it through the concat)
-        auto tail = [&](ggml_tensor * x) {
-            return ggml_view_4d(ctx0, x, x->ne[0], x->ne[1], P, x->ne[3], x->nb[1], x->nb[2], x->nb[3], (T - P) * x->nb[2]);
-        };
-        auto pdst = [&](int64_t ne0, int64_t ne1, int64_t off) {
-            return ggml_view_4d(ctx0, p_all, ne0, ne1, P, n_seqs, ne0*f, p_tok*f, p_all->nb[1], kv_head * p_all->nb[1] + off*f);
-        };
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail(k_all), pdst(S_k, H_k, 0)));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail(v_all), pdst(S_v, H_v, n_kf)));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail(g_all), pdst(1,   H_v, n_kf + n_vf)));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail(b_all), pdst(1,   H_v, n_kf + n_vf + H_v)));
+        ggml_tensor * p_new = ggml_view_2d(ctx0, gdn_out, p_all->ne[0], n_seqs, ggml_row_size(gdn_out->type, p_all->ne[0]),
+            ggml_row_size(gdn_out->type, attn_elems + D * n_seqs));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, p_new,
+            ggml_view_2d(ctx0, p_all, p_all->ne[0], n_seqs, p_all->nb[1], kv_head * p_all->nb[1])));
 
         return output;
     }

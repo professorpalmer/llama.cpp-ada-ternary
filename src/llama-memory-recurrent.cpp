@@ -129,7 +129,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         s_l[i] = s;
         if (replay) {
             GGML_ASSERT(type_s == GGML_TYPE_F32);
-            ggml_tensor * p = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) pend_tok() * n_rs_seq, mem_size);
+            ggml_tensor * p = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) pend_tok() * n_rs_seq + 1, mem_size);   // + the valid count
             ggml_format_name(p, "cache_p_l%d", i);
             p_l[i] = p;
         }
@@ -994,7 +994,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             }
             for (uint32_t il = 0; il < n_layer; ++il) {
                 if (p_l[il] == nullptr) continue;
-                const uint64_t p_size_row = ggml_row_size(GGML_TYPE_F32, (int64_t) p_tok * n_pend);
+                const uint64_t p_size_row = ggml_row_size(GGML_TYPE_F32, (int64_t) p_tok * n_pend + 1);
                 io.write(&p_size_row, sizeof(p_size_row));
                 for (const auto & range : cell_ranges_s) {
                     io.write_tensor(p_l[il], range.first * p_size_row, (range.second - range.first) * p_size_row);
@@ -1212,7 +1212,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         if (replay) {
             const uint32_t n_pend = n_rs_seq;
             const uint32_t p_tok  = pend_tok();
-            std::vector<uint32_t> masks(cell_count, n_pend);   // a plain S file: no pending token is valid
+            std::vector<uint32_t> masks(cell_count, 0);   // rejected pending tokens per cell (the rollback at the save)
             if (s_trans == 2) {
                 uint32_t n_pend_ref = 0;
                 uint32_t p_tok_ref  = 0;
@@ -1231,7 +1231,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
                     }
                 }
             }
-            const size_t row_floats = (size_t) p_tok * n_pend;
+            const size_t row_floats = (size_t) p_tok * n_pend + 1;   // + the valid count
             std::vector<float> buf(row_floats * cell_count, 0.0f);
             for (uint32_t il = 0; il < n_layer; ++il) {
                 if (p_l[il] == nullptr) continue;
@@ -1247,14 +1247,12 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
                         io.read(buf.data(), buf.size() * sizeof(float));
                     }
                 } else {
-                    std::fill(buf.begin(), buf.end(), 0.0f);
+                    std::fill(buf.begin(), buf.end(), 0.0f);   // a plain S file: count 0, no pending token
                 }
-                // the rejected (last masks[i]) pending tokens of each cell skip: gate = beta = -inf
+                // the rejected (last masks[i]) pending tokens of each cell leave the valid count
                 for (uint32_t i = 0; i < cell_count; ++i) {
-                    for (uint32_t t = n_pend - masks[i]; t < n_pend; ++t) {
-                        float * tok = buf.data() + i * row_floats + (size_t) t * p_tok;
-                        std::fill(tok + pend_k + pend_v, tok + p_tok, -INFINITY);
-                    }
+                    float & cnt = buf[i * row_floats + row_floats - 1];
+                    cnt = (float) std::max(0, (int) cnt - (int) masks[i]);
                 }
                 if (cell_count) {
                     ggml_backend_tensor_set(p_l[il], buf.data(), head * row_floats * sizeof(float), buf.size() * sizeof(float));
@@ -1400,19 +1398,22 @@ int32_t llama_memory_recurrent_context::s_copy0(int i) const {
     return mem->cells[i + mem->head].src0;
 }
 
-uint32_t llama_memory_recurrent_context::s_pend_mask(int i) const {
+void llama_memory_recurrent_context::s_pend_info(int i, int32_t & row, int32_t & rejected, int32_t & fresh) const {
     const uint32_t cell_idx = i + mem->head;
     const auto & cell = mem->cells[cell_idx];
-    if (cell.src0 < 0 || cell.src0 == mem->rs_z) {
-        return mem->n_rs_seq;   // a new (zeroed) state: its pending inputs are not its own
+    row      = cell.src0;
+    rejected = 0;
+    fresh    = cell.src0 < 0 || cell.src0 == mem->rs_z;   // a new (zeroed) state: its pending inputs are not its own
+    if (fresh) {
+        row = std::max<int32_t>(cell.src0, 0);
+        return;
     }
     if (!cell.seq_id.empty()) {
         const llama_seq_id seq = *cell.seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
-            return mem->rs_idx[seq];
+            rejected = (int32_t) mem->rs_idx[seq];
         }
     }
-    return 0;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
