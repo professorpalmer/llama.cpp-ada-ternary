@@ -84,10 +84,14 @@ llama_memory_recurrent::llama_memory_recurrent(
             if (filter && !filter(i)) continue;
             const auto & l = model.layers[i];
             raw_ok = l.ssm_dt && l.ssm_dt->type == GGML_TYPE_F32 && l.ssm_a && l.ssm_a->type == GGML_TYPE_F32;
+            // the replay op is CUDA only: every recurrent layer must sit on a GPU device
+            raw_ok = raw_ok && offload && ggml_backend_dev_type(model.dev_layer(i)) == GGML_BACKEND_DEVICE_TYPE_GPU;
         }
-        replay = want && n_rs_seq > 0 && raw_ok && hparams.ssm_d_state > 0 && hparams.ssm_dt_rank > 0;
+        // one sequence per context: with more, find_slot relocates cells and only their S rows move (not the pending rows)
+        replay = want && n_rs_seq > 0 && raw_ok && n_seq_max == 1 && hparams.ssm_d_state > 0 && hparams.ssm_dt_rank > 0;
         if (want && !replay) {
-            LLAMA_LOG_WARN("%s: LLAMA_RS_REPLAY ignored (needs n_rs_seq > 0 and a qwen35 model with raw GDN gates)\n", __func__);
+            LLAMA_LOG_WARN("%s: LLAMA_RS_REPLAY ignored (needs n_rs_seq > 0, one sequence, every recurrent layer on a GPU "
+                           "and a qwen35 model with raw GDN gates)\n", __func__);
         }
         if (replay) {
             pend_k = hparams.ssm_d_state * hparams.ssm_n_group;

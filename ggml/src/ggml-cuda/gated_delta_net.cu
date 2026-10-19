@@ -325,8 +325,30 @@ gated_delta_net_cuda(const float * q,
         }
     }
 
-    if (p_dst != nullptr && h_idx == 0 && blockIdx.z == 0 && threadIdx.y == 0 && lane == 0) {
-        p_dst[(int64_t) rp.P * rp.p_tok] = (float) c_new;
+    if (p_dst != nullptr) {
+        // unused slots (fewer than P combined tokens): zeros, so saved rows do not depend on old memory
+        for (int sl = c_new; sl < rp.P; ++sl) {
+            float * pt = p_dst + (int64_t) sl * rp.p_tok;
+            if (h_idx == iq1 && blockIdx.z == 0 && threadIdx.y == 0) {
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    pt[iq1 * S_v + r * warp_size + lane] = 0.0f;
+                }
+            }
+            if (lane == 0) {
+#pragma unroll
+                for (int c = 0; c < cols_per_warp; ++c) {
+                    pt[rp.n_kf + h_idx * S_v + col + c] = 0.0f;
+                }
+            }
+            if (blockIdx.z == 0 && threadIdx.y == 0 && lane == 0) {
+                pt[rp.n_kf + rp.n_vf + h_idx]     = 0.0f;
+                pt[rp.n_kf + rp.n_vf + H + h_idx] = 0.0f;
+            }
+        }
+        if (h_idx == 0 && blockIdx.z == 0 && threadIdx.y == 0 && lane == 0) {
+            p_dst[(int64_t) rp.P * rp.p_tok] = (float) c_new;
+        }
     }
 
     if constexpr (!keep_rs_t) {
