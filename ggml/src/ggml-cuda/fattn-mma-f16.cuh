@@ -5,6 +5,11 @@
 
 using namespace ggml_cuda_mma;
 
+// Rows of each F16 V tile to read into registers ahead of time when there are no pipeline stages (0: off).
+#ifndef GGML_CUDA_FA_F16_V_ROWS
+#define GGML_CUDA_FA_F16_V_ROWS 0
+#endif
+
 // Config options for the MMA kernel.
 // Should not affect results, only speed/register pressure/shared memory use.
 struct fattn_mma_config {
@@ -673,6 +678,26 @@ static __device__ __forceinline__ void flash_attn_ext_f16_store_tile_q(
     }
 }
 
+// F16 tile rows of one warp-wide row of 16 byte chunks (D2 == 4*warp_size), in registers: the same thread to chunk map as flash_attn_ext_f16_load_tile without cp_async.
+template<int nwarps, bool oob_check, int ns>
+static __device__ __forceinline__ void flash_attn_ext_f16_fetch_rows(
+        const half2 * const __restrict__ KV, int4 (&w)[ns], const int stride_KV, const int i_sup) {
+#pragma unroll
+    for (int s = 0; s < ns; ++s) {
+        const int i = s*nwarps + threadIdx.y;
+        w[s] = !oob_check || i < i_sup ? *((const int4 *) (KV + i*stride_KV + threadIdx.x*4)) : make_int4(0, 0, 0, 0);
+    }
+}
+
+template<int stride_tile, int nwarps, int ns>
+static __device__ __forceinline__ void flash_attn_ext_f16_store_rows(half2 * const __restrict__ tile_KV, const int4 (&w)[ns]) {
+#pragma unroll
+    for (int s = 0; s < ns; ++s) {
+        const int i = s*nwarps + threadIdx.y;
+        ggml_cuda_memcpy_1<16>(tile_KV + i*stride_tile + threadIdx.x*4, &w[s]);
+    }
+}
+
 // The mask pointer for the KV tile starting at cell k0: f16 masks index halves, packed masks (stride_mask < 0,
 // see flash_attn_ext_f16 below) index 32-bit words; k0 is a multiple of the tile size, so of 32.
 static __device__ __forceinline__ const half * flash_attn_ext_f16_mask_at(const half * mask_h, const int stride_mask, const int k0) {
@@ -874,6 +899,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             ((const char *) K_h2 + int64_t(k_VKQ_0)*stride_K, wK, stride_K, k_VKQ_sup);
         flash_attn_ext_f16_fetch_tile_q<type_KV, nwarps, nbatch_fa, DV, oob_check>
             ((const char *) V_h2 + int64_t(k_VKQ_0)*stride_V, wV, stride_V, k_VKQ_sup);
+    }
+
+    // F16 K/V without pipeline stages (no cp.async, Turing): fetch the first rows of the V tile now, store them when V is needed.
+    constexpr int rows_V_pf = type_KV == GGML_TYPE_F16 && nstages == 0 && !V_is_K_view && 2*nbatch_V2 == DV && DV/2 == 4*warp_size ?
+        (GGML_CUDA_FA_F16_V_ROWS < nbatch_fa ? GGML_CUDA_FA_F16_V_ROWS : nbatch_fa) : 0;
+    static_assert(rows_V_pf % nwarps == 0, "bad GGML_CUDA_FA_F16_V_ROWS");
+    int4 wVf[rows_V_pf > 0 ? rows_V_pf/nwarps : 1];
+    if constexpr (rows_V_pf > 0) {
+        flash_attn_ext_f16_fetch_rows<nwarps, oob_check>(V_h2 + int64_t(k_VKQ_0)*stride_V, wVf, stride_V, k_VKQ_sup);
     }
 
     // For MLA K and V have the same data.
@@ -1243,7 +1277,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             const int i0_diff = i0_stop - i0_start;
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
-                if constexpr (type_KV == GGML_TYPE_F16) {
+                if constexpr (rows_V_pf > 0) {
+                    flash_attn_ext_f16_store_rows<stride_tile_V, nwarps>(tile_V, wVf);
+                    if constexpr (rows_V_pf < nbatch_fa) {
+                        flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa - rows_V_pf, false, oob_check>
+                            (V_h2 + int64_t(k_VKQ_0 + rows_V_pf)*stride_V, tile_V + rows_V_pf*stride_tile_V, i0_diff/2, stride_V, k_VKQ_sup - rows_V_pf);
+                    }
+                } else if constexpr (type_KV == GGML_TYPE_F16) {
                     constexpr bool use_cp_async = nstages == 1;
                     flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check>
                         (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
