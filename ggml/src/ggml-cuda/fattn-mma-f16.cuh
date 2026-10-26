@@ -847,6 +847,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
 #endif // defined(TURING_MMA_AVAILABLE)
 
+    // prefill-kq-20261026 P2 (measurement build only): K*Q accumulates in fp16 (full-rate tensor math on GeForce),
+    // then expands to fp32 before the softmax.
+#if defined(GGML_PKQ_FP16ACC) && defined(TURING_MMA_AVAILABLE)
+    constexpr bool kq_fp16 = cols_per_warp != 8;
+#else
+    constexpr bool kq_fp16 = false;
+#endif // defined(GGML_PKQ_FP16ACC) && defined(TURING_MMA_AVAILABLE)
+    tile<16, 8, half2> KQ_H[kq_fp16 ? sizeof(KQ_C)/sizeof(KQ_C[0]) : 1];
+
     if constexpr (nstages > 1) {
         static_assert(!oob_check, "OOB check incompatible with multi-stage pipeline");
         static_assert(!V_is_K_view, "K data reuse not implemented multi-stage loading");
@@ -918,7 +927,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                         mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[k_KQ_0/T_A_KQ::J]);
 #else
                         // swap A and B for CUDA.
-                        mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[k_KQ_0/T_A_KQ::J], K_A);
+                        if constexpr (kq_fp16) {
+                            mma(KQ_H[i_KQ_00/(np*T_A_KQ::I)], Q_B[k_KQ_0/T_A_KQ::J], K_A);
+                        } else {
+                            mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[k_KQ_0/T_A_KQ::J], K_A);
+                        }
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
                     }
                 }
@@ -945,7 +958,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                         mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], K_A, Q_B[0]);
 #else
                         // swap A and B for CUDA.
-                        mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[0], K_A);
+                        if constexpr (kq_fp16) {
+                            mma(KQ_H[i_KQ_00/(np*T_A_KQ::I)], Q_B[0], K_A);
+                        } else {
+                            mma(KQ_C[i_KQ_00/(np*T_A_KQ::I)], Q_B[0], K_A);
+                        }
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
                     }
                 }
@@ -954,6 +971,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             __syncthreads(); // Only needed if tile_K == tile_V.
+        }
+    }
+
+    if constexpr (kq_fp16) {
+#pragma unroll
+        for (int i = 0; i < int(sizeof(KQ_C)/sizeof(KQ_C[0])); ++i) {
+#pragma unroll
+            for (int l = 0; l < T_C_KQ::ne/2; ++l) {
+                KQ_C[i].x[2*l + 0] = __low2float (KQ_H[i].x[l]);
+                KQ_C[i].x[2*l + 1] = __high2float(KQ_H[i].x[l]);
+            }
         }
     }
 
