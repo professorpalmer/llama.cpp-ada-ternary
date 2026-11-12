@@ -1805,6 +1805,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
+        if (const char * env = getenv("LLAMA_DFLASH_CAUSAL")) { // research override (DSpine port check)
+            causal_attn = atoi(env) != 0;
+            LOG_WRN("%s: LLAMA_DFLASH_CAUSAL=%d overrides the draft attention\n", __func__, (int) causal_attn);
+        }
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
     }
 
@@ -2042,6 +2046,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                     }
                     result.push_back((llama_token) row[predecessor]);
+                }
+                {
+                    static const bool dbg = getenv("LLAMA_DSPINE_DEBUG") != nullptr;
+                    static int n_dbg = 0;
+                    if (dbg && n_dbg++ < 40) {
+                        std::string s;
+                        for (auto t : result) { s += std::to_string(t) + " "; }
+                        const float * row1 = lattice + (size_t) (beg + 1) * n_embd_dec;
+                        std::string c;
+                        for (int32_t k = 0; k < selector_top_k; ++k) { c += std::to_string((int) row1[k]) + " "; }
+                        LOG_WRN("dspine dbg: n_past=%d id_last=%d draft=[%s] row1 cands=[%s]\n", (int) dp.n_past, (int) dp.id_last, s.c_str(), c.c_str());
+                    }
                 }
 
                 if (result.size() < (size_t) params.n_min) {
