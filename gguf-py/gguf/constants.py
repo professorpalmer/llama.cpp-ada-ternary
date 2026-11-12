@@ -283,6 +283,10 @@ class Keys:
     class WKV:
         HEAD_SIZE = "{arch}.wkv.head_size"
 
+    class DSpine:
+        HEAD_TOPK = "{arch}.dspine.head_topk"
+        EPS       = "{arch}.dspine.eps"
+
     class PosNet:
         EMBEDDING_LENGTH = "{arch}.posnet.embedding_length"
         BLOCK_COUNT      = "{arch}.posnet.block_count"
@@ -1179,6 +1183,12 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_SELECTOR_PREV   = auto()
     DFLASH_SELECTOR_NEXT   = auto()
     DFLASH_SELECTOR_HIDDEN = auto()
+    DSPINE_CODEBOOK               = auto()
+    DSPINE_GATE                   = auto()
+    DSPINE_PRED_GATE              = auto()
+    DSPINE_PREV                   = auto()
+    DSPINE_READ                   = auto()
+    DSPINE_WRITE                  = auto()
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -1949,6 +1959,12 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_PREV:      "selector_predecessor",
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
+    MODEL_TENSOR.DSPINE_CODEBOOK:                       "dspine_codebook",
+    MODEL_TENSOR.DSPINE_GATE:                           "dspine_gate",
+    MODEL_TENSOR.DSPINE_PRED_GATE:                      "dspine_pred_gate",
+    MODEL_TENSOR.DSPINE_PREV:                           "dspine_prev",
+    MODEL_TENSOR.DSPINE_READ:                           "blk.{bid}.dspine_read",
+    MODEL_TENSOR.DSPINE_WRITE:                          "blk.{bid}.dspine_write",
     MODEL_TENSOR.D2T:                       "d2t",
 }
 
@@ -5045,6 +5061,12 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DFLASH_SELECTOR_PREV,
         MODEL_TENSOR.DFLASH_SELECTOR_NEXT,
         MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN,
+        MODEL_TENSOR.DSPINE_CODEBOOK,
+        MODEL_TENSOR.DSPINE_GATE,
+        MODEL_TENSOR.DSPINE_PRED_GATE,
+        MODEL_TENSOR.DSPINE_PREV,
+        MODEL_TENSOR.DSPINE_READ,
+        MODEL_TENSOR.DSPINE_WRITE,
     ],
     MODEL_ARCH.MISTRAL4: [
         MODEL_TENSOR.TOKEN_EMBD,

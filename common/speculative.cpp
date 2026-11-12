@@ -1670,6 +1670,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // dspark speculators
     bool sample_from_anchor = true;
 
+    // block-internal attention
+    bool causal_attn = false;
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -1719,8 +1722,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (llama_model_meta_val_str(model_dft, "dflash.sample_from_anchor", buf, sizeof(buf)) >= 0) {
                 sample_from_anchor = std::strcmp(buf, "true") == 0;
             }
+            // block-causal drafts (DSpine) declare causal attention in the GGUF
+            if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0) {
+                causal_attn = std::strcmp(buf, "true") == 0;
+            }
         }
 
+        // DSpine also reports its lattice width here and reuses the DFlash2 lattice path
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
@@ -1744,6 +1752,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     __func__, this->params.n_max, this->params.n_min, block_size, n_draft_max);
             this->params.n_max = std::min(this->params.n_max, n_draft_max);
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
+        }
+
+        // the DSpine code bridge and lattice need whole blocks, so the blocks of all sequences must fit one draft ubatch
+        {
+            char buf[16] = {};
+            const bool is_dspine = llama_model_meta_val_str(model_dft, "dflash.dspine.head_topk", buf, sizeof(buf)) >= 0;
+            if (is_dspine && (int64_t) n_seq * (this->params.n_max + 1) > (int64_t) llama_n_ubatch(ctx_dft)) {
+                throw std::runtime_error("DSpine draft needs --spec-draft-n-ubatch >= n_parallel * (--spec-draft-n-max + 1)");
+            }
         }
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
@@ -1788,7 +1805,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
-        llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
+        llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
     }
 
     ~common_speculative_impl_draft_dflash() override {

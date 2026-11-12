@@ -228,6 +228,8 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    uint32_t dspine_head_topk        = 0;
+    float    dspine_eps              = 0.0f;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
