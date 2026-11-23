@@ -1339,6 +1339,9 @@ static bool ggml_cuda_tier_staging_handle(int physical, const std::string & key,
 // when sparse attention first engages. The chunk joins the staged host tail: its alias pages get a VRAM staging slot of
 // their own, and the entry's host runs (the tier line, staging, write-back, the CUDA-graph check) include it from then on.
 // Kernels keep the same addresses. Returns the bytes of VRAM freed.
+// defined below with the tier allocator: cuMemCreate on the first host location type this driver accepts
+static CUresult ggml_cuda_hostmem_create(CUmemGenericAllocationHandle * h, size_t len, int physical);
+
 static size_t ggml_cuda_tier_demote_all() {
     std::lock_guard<std::mutex> lock(g_tier_mutex);
     size_t freed = 0;
@@ -1346,10 +1349,6 @@ static size_t ggml_cuda_tier_demote_all() {
         if (rec->demoted || !rec->demotable) {
             continue;
         }
-        CUmemAllocationProp ph = {};
-        ph.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
-        ph.location.type = CU_MEM_LOCATION_TYPE_HOST;
-        ph.location.id   = 0;
         CUmemAccessDesc ad = {};
         ad.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         ad.location.id   = rec->physical;
@@ -1360,7 +1359,7 @@ static size_t ggml_cuda_tier_demote_all() {
                 continue;
             }
             CUmemGenericAllocationHandle hh;
-            CU_CHECK(cuMemCreate(&hh, rr.len, &ph, 0));
+            CU_CHECK(ggml_cuda_hostmem_create(&hh, rr.len, rec->physical));   // HOST, or HOST_NUMA on 570 drivers
             // copy the chunk through a temporary mapping of the host handle, then swap the mapping at the same address
             CUdeviceptr tmp = 0;
             CU_CHECK(cuMemAddressReserve(&tmp, rr.len, 0, 0, 0));
