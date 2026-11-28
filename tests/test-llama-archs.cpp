@@ -44,7 +44,8 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     std::hash<std::string> hasher;
     seed ^= hasher(tensor->name);
     std::mt19937 gen(seed);
-    std::normal_distribution<float> dis(0.0f, 1.0e-2f);
+    const char * e_std = getenv("TEST_INIT_STD"); // a larger value makes the outputs react to the recurrent state
+    std::normal_distribution<float> dis(0.0f, e_std ? (float) atof(e_std) : 1.0e-2f);
 
     const int64_t ne = ggml_nelements(tensor);
     if (tensor->type == GGML_TYPE_F32) {
