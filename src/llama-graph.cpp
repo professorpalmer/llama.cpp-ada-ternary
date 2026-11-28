@@ -416,6 +416,20 @@ void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mct
         }
     }
 
+    if (s_copy_planes && s_copy_planes->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_planes->buffer));
+        int32_t * data = (int32_t *) s_copy_planes->data;
+        const int64_t n_extra  = s_copy_planes->ne[0] / s_planes_K;
+        const int64_t mem_size = mctx_cur->get_size();
+        const int64_t n_main   = n_rs - n_extra;
+        for (int64_t k = 1; k <= s_planes_K; ++k) {
+            for (int64_t j = 0; j < n_extra; ++j) {
+                const int32_t src0 = mctx_cur->s_copy0((int) (n_main + j));
+                data[(k - 1)*n_extra + j] = (int32_t) (k*mem_size + std::max<int32_t>(src0, 0));
+            }
+        }
+    }
+
     if (s_write_rows) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_write_rows->buffer));
         int64_t * data = (int64_t *) s_write_rows->data;
@@ -439,6 +453,15 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
 
     res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= s_copy_extra->ne[0] == mctx_cur->get_n_rs() - params.ubatch.n_seqs;
+
+    // rollback planes: a graph built without extra cells has no plane copy; it can not serve a ubatch with extra cells
+    if (s_planes_K > 0) {
+        if (s_copy_planes) {
+            res &= s_copy_planes->ne[0] == s_planes_K * ((int64_t) mctx_cur->get_n_rs() - params.ubatch.n_seqs);
+        } else {
+            res &= mctx_cur->get_n_rs() == params.ubatch.n_seqs;
+        }
+    }
 
     if (s_write_rows) {
         res &= s_write_rows->ne[0] ==
@@ -3755,9 +3778,38 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
 
-    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+    ggml_tensor * output_states = build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+
+    // Rollback planes (n_rs_seq > 0): the cache has 1 + K rows per cell, plane k of cell c in row k*size + c.
+    // find_slot can move the cell of a sequence that is not in this ubatch (an "extra" cell, between head + n_seqs
+    // and head + n_rs); the copy above moves only its live state. Move its K snapshot planes too, so that a later
+    // rollback of that sequence reads its own snapshots, not the old rows of another sequence (NetSphere bench report,
+    // 2026-11-27; tests/test-recurrent-cell-move). The planes are read here, before this ubatch writes the snapshots
+    // of its own sequences (which can land in the old rows). No extra cell -> no node: one sequence is unchanged.
+    const uint32_t rs_size = kv_state->get_size();
+    const int64_t  n_rows  = ggml_nelements(s) / state_size;
+    const int64_t  K       = n_rows / rs_size - 1;
+    const int64_t  n_extra = (int64_t) kv_state->get_n_rs() - n_seqs;
+    if (K > 0 && !inp->s_pinfo) {
+        GGML_ASSERT(inp->s_planes_K == 0 || inp->s_planes_K == K);
+        inp->s_planes_K = K;   // also without extra cells: can_reuse then refuses a ubatch that has some
+    }
+    if (K > 0 && n_extra > 0 && !inp->s_pinfo) {
+        if (inp->s_copy_planes == nullptr) {
+            inp->s_copy_planes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, K * n_extra);
+            ggml_set_input(inp->s_copy_planes);
+        }
+        ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, n_rows);
+        ggml_tensor * planes = ggml_get_rows(ctx0, states, inp->s_copy_planes);   // {state_size, K * n_extra}
+        planes = ggml_reshape_3d(ctx0, planes, state_size, n_extra, K);
+        ggml_tensor * dst = ggml_view_3d(ctx0, states, state_size, n_extra, K, states->nb[1],
+                (size_t) rs_size * states->nb[1], (size_t) (rs_size + kv_state->get_head() + n_seqs) * states->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, planes, dst));
+    }
+
+    return output_states;
 }
 
 ggml_tensor * llm_graph_context::build_rs_cache_view(

@@ -189,12 +189,14 @@ llama_context::llama_context(
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
-    // Guard (Kintsugi-27B v1.2.2). With more than one sequence, llama_memory_recurrent::find_slot can move the cell of a
-    // sequence and only its live state moves; its rollback snapshots stay in the old row. A rollback then reads the old
-    // state of another sequence (corrupted text; NetSphere bench report, 2026-11-27; tests/test-recurrent-cell-move).
-    // Until the snapshots move with their cell, a context with several sequences gets no rollback snapshots: a partial
-    // llama_memory_seq_rm is then refused, as for a recurrent model without rollback. llama-server turns drafting off.
-    if (cparams.n_rs_seq > 0 && cparams.n_seq_max > 1 && model.arch != LLM_ARCH_DEEPSEEK4) {
+    // Safety net (Kintsugi-27B v1.2.2), opt-in: LLAMA_RS_MULTI_SEQ_GUARD=1. With more than one sequence,
+    // llama_memory_recurrent::find_slot can move the cell of a sequence; up to v1.2.1 only its live state moved and its
+    // rollback snapshots stayed in the old row, so a rollback read the old state of another sequence (NetSphere bench
+    // report, 2026-11-27; tests/test-recurrent-cell-move). build_rs now moves the snapshot planes with the cell. The
+    // guard gives a context with several sequences no rollback snapshots (a partial seq_rm is refused); llama-server
+    // then turns drafting off with more than one slot.
+    static const bool multi_seq_guard = getenv("LLAMA_RS_MULTI_SEQ_GUARD") && atoi(getenv("LLAMA_RS_MULTI_SEQ_GUARD")) != 0;
+    if (multi_seq_guard && cparams.n_rs_seq > 0 && cparams.n_seq_max > 1 && model.arch != LLM_ARCH_DEEPSEEK4) {
         LLAMA_LOG_WARN("%s: recurrent-state rollback is off with more than one sequence (n_seq_max = %u): n_rs_seq %u -> 0. "
                        "Use one sequence for drafting with rollback.\n", __func__, cparams.n_seq_max, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;

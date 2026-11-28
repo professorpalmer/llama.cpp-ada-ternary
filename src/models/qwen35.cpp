@@ -568,7 +568,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 && !inp->s_pinfo;
+    // one sequence only: with several, find_slot can move cells, and the gathered path (build_rs) moves the live
+    // state and the rollback planes of a moved cell after the main rows are read (rows mode reads them later)
+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 && !inp->s_pinfo &&
+                                cparams.n_seq_max == 1;
 
     ggml_tensor * state;
     if (inp->s_pinfo) {

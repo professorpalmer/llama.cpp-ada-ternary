@@ -1178,19 +1178,20 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        // Guard (Kintsugi-27B v1.2.2): drafting with more than one slot can corrupt answers on a model with recurrent
-        // state (a rejected draft is rolled back from a snapshot that can belong to another slot; NetSphere bench
-        // report, 2026-11-27). With more than one slot the server does not draft at all: no draft model is loaded, no
-        // lookup drafting, and the context keeps no rollback snapshots (llama_context). One slot drafts as before.
+        // Safety net (Kintsugi-27B v1.2.2), opt-in: LLAMA_RS_MULTI_SEQ_GUARD=1. Up to v1.2.1, drafting with more than
+        // one slot could corrupt answers on a model with recurrent state (a rejected draft was rolled back from a
+        // snapshot that could belong to another slot; NetSphere bench report, 2026-11-27). v1.2.2 moves the snapshots
+        // with their cell (build_rs). With the guard, a server with more than one slot does not draft at all: no draft
+        // model is loaded, no lookup drafting, and the context keeps no rollback snapshots (llama_context).
         bool spec_off_multi_slot = false;
-        {
+        static const bool multi_seq_guard = getenv("LLAMA_RS_MULTI_SEQ_GUARD") && atoi(getenv("LLAMA_RS_MULTI_SEQ_GUARD")) != 0;
+        if (multi_seq_guard) {
             const bool spec_requested = std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
                     [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
             if (spec_requested && params_base.n_parallel > 1 &&
                     (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt))) {
-                SRV_WRN("drafting is OFF: the server has %d slots (-np %d) and this model keeps a recurrent state. "
-                        "Drafting with more than one slot can corrupt answers, so this build does not allow it. "
-                        "Start with -np 1 to draft (DFlash / MTP / lookup).\n",
+                SRV_WRN("drafting is OFF: the server has %d slots (-np %d), this model keeps a recurrent state and "
+                        "LLAMA_RS_MULTI_SEQ_GUARD is set. Start with -np 1, or without the guard, to draft.\n",
                         params_base.n_parallel, params_base.n_parallel);
                 params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
                 spec_off_multi_slot = true;

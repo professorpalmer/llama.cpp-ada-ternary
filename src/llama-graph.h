@@ -386,6 +386,12 @@ public:
     ggml_tensor * s_write_rows = nullptr;
     int64_t       s_write_K    = 0;
 
+    // rollback planes of the extra cells (cells in [head, head + n_rs) that are not in the ubatch): I32
+    // [K * (n_rs - n_seqs)], source row k*size + src0 for plane k = 1..K. find_slot can move such a cell;
+    // its K snapshot planes must move with its live state (plane 0). Created lazily, only when extra cells exist.
+    ggml_tensor * s_copy_planes = nullptr;
+    int64_t       s_planes_K    = 0;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
