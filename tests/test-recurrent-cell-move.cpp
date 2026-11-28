@@ -27,6 +27,8 @@
 #include <cstdlib>
 #include <vector>
 
+static bool g_no_rollback = false; // the context gives no rollback snapshots for several sequences (v1.2.2 guard)
+
 static llama_token tok(uint32_t seq, llama_pos pos, int n_vocab) {
     return (llama_token) ((7*(uint32_t) pos + 31*seq + 1) % (uint32_t) n_vocab);
 }
@@ -55,7 +57,9 @@ static std::vector<float> run_schedule(const common_params & params, llama_model
         return out;
     }
     if (llama_n_rs_seq(ctx) < n_rs_seq) {
-        fprintf(stderr, "%s : n_rs_seq %u is not available (%u)\n", __func__, n_rs_seq, llama_n_rs_seq(ctx));
+        // the v1.2.2 guard: no rollback snapshots with more than one sequence
+        fprintf(stderr, "%s : n_rs_seq %u is not available with %u sequences (%u)\n", __func__, n_rs_seq, n_seqs, llama_n_rs_seq(ctx));
+        g_no_rollback = true;
         llama_free(ctx);
         return out;
     }
@@ -159,6 +163,11 @@ int main(int argc, char ** argv) {
         for (uint32_t r = 0; r <= n_rs_seq; ++r) {
             const std::vector<float> la = run_schedule(params, model, n_vocab, c.order_a, n_rs_seq, r);
             const std::vector<float> lb = run_schedule(params, model, n_vocab, c.order_b, n_rs_seq, r);
+            if (g_no_rollback) {
+                fprintf(stderr, "skip  %s: this build keeps no rollback snapshots with more than one sequence (guard)\n", c.name);
+                g_no_rollback = false;
+                break;
+            }
             if (la.empty() || lb.empty() || la.size() != lb.size()) {
                 fprintf(stderr, "FAIL  %s, rollback %u: the schedule did not run\n", c.name, r);
                 n_fail++;

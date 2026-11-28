@@ -1178,7 +1178,26 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (has_spec) {
+        // Guard (Kintsugi-27B v1.2.2): drafting with more than one slot can corrupt answers on a model with recurrent
+        // state (a rejected draft is rolled back from a snapshot that can belong to another slot; NetSphere bench
+        // report, 2026-11-27). With more than one slot the server does not draft at all: no draft model is loaded, no
+        // lookup drafting, and the context keeps no rollback snapshots (llama_context). One slot drafts as before.
+        bool spec_off_multi_slot = false;
+        {
+            const bool spec_requested = std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                    [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+            if (spec_requested && params_base.n_parallel > 1 &&
+                    (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt))) {
+                SRV_WRN("drafting is OFF: the server has %d slots (-np %d) and this model keeps a recurrent state. "
+                        "Drafting with more than one slot can corrupt answers, so this build does not allow it. "
+                        "Start with -np 1 to draft (DFlash / MTP / lookup).\n",
+                        params_base.n_parallel, params_base.n_parallel);
+                params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+                spec_off_multi_slot = true;
+            }
+        }
+
+        if (has_spec && !spec_off_multi_slot) {
             // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
             load_progress_callback(0.0f, &load_progress_spec);
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
@@ -1291,7 +1310,7 @@ private:
         }
 
         // try speculative decoding
-        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && !spec_off_multi_slot) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
